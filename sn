@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+sn - Standalone ServiceNow CLI for querying and managing tickets.
+Zero external dependencies (uses Python 3 standard library only).
+"""
+
+import argparse
+import base64
+import csv
+import getpass
+import json
+import os
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+CONFIG_PATH = Path.home() / ".config" / "servicenow" / "config.json"
+
+PREFIX_TABLE_MAP = {
+    "INC": "incident",
+    "RITM": "sc_req_item",
+    "REQ": "sc_request",
+    "SCTASK": "sc_task",
+    "CHG": "change_request",
+    "CTASK": "change_task",
+    "PRB": "problem",
+    "PTASK": "problem_task",
+    "KB": "kb_knowledge",
+    "TASK": "task",
+}
+
+DEFAULT_FIELDS = [
+    "number",
+    "sys_class_name",
+    "state",
+    "priority",
+    "assigned_to",
+    "assignment_group",
+    "sys_updated_on",
+    "short_description",
+]
+
+
+class Colors:
+    ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    BOLD = "\033[1m" if ENABLED else ""
+    DIM = "\033[2m" if ENABLED else ""
+    CYAN = "\033[36m" if ENABLED else ""
+    GREEN = "\033[32m" if ENABLED else ""
+    YELLOW = "\033[33m" if ENABLED else ""
+    RED = "\033[31m" if ENABLED else ""
+    RESET = "\033[0m" if ENABLED else ""
+
+
+def normalize_instance_url(instance: str) -> str:
+    instance = instance.strip().rstrip("/")
+    if not instance:
+        return ""
+    if not instance.startswith("http://") and not instance.startswith("https://"):
+        if "." not in instance:
+            instance = f"https://{instance}.service-now.com"
+        else:
+            instance = f"https://{instance}"
+    return instance
+
+
+def load_config(profile: str = "default") -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                profiles = data.get("profiles", {})
+                active = profile if profile != "default" else data.get("default_profile", "default")
+                cfg = profiles.get(active, {})
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not read {CONFIG_PATH}: {e}\n")
+
+    # Environment variable overrides
+    if os.environ.get("SN_INSTANCE"):
+        cfg["instance"] = normalize_instance_url(os.environ["SN_INSTANCE"])
+    if os.environ.get("SN_USER"):
+        cfg["username"] = os.environ["SN_USER"]
+    if os.environ.get("SN_PASS"):
+        cfg["password"] = os.environ["SN_PASS"]
+        cfg.setdefault("auth_type", "basic")
+    if os.environ.get("SN_TOKEN"):
+        cfg["token"] = os.environ["SN_TOKEN"]
+        cfg["auth_type"] = "token"
+
+    return cfg
+
+
+def save_config(profile: str, profile_data: Dict[str, Any]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data: Dict[str, Any] = {"default_profile": profile, "profiles": {}}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data.setdefault("profiles", {})[profile] = profile_data
+    data["default_profile"] = profile
+
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def detect_table(identifier: str, explicit_table: Optional[str] = None) -> str:
+    if explicit_table:
+        return explicit_table
+    upper = identifier.upper()
+    for prefix, table in sorted(PREFIX_TABLE_MAP.items(), key=lambda x: -len(x[0])):
+        if upper.startswith(prefix):
+            return table
+    return "task"
+
+
+def extract_display(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, dict):
+        return str(val.get("display_value") or val.get("value") or "")
+    return str(val)
+
+
+def sn_request(
+    cfg: Dict[str, Any],
+    method: str,
+    path: str,
+    params: Optional[Dict[str, str]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    instance = cfg.get("instance")
+    if not instance:
+        sys.stderr.write(
+            f"{Colors.RED}Error:{Colors.RESET} ServiceNow instance not configured.\n"
+            f"Run '{Colors.BOLD}sn config{Colors.RESET}' or set SN_INSTANCE, SN_USER, SN_PASS.\n"
+        )
+        sys.exit(1)
+
+    url = f"{instance.rstrip('/')}/{path.lstrip('/')}"
+    if params:
+        query_string = urllib.parse.urlencode(params)
+        url = f"{url}?{query_string}"
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "sn-cli/1.0",
+    }
+
+    auth_type = cfg.get("auth_type", "basic")
+    if auth_type == "token" and cfg.get("token"):
+        headers["Authorization"] = f"Bearer {cfg['token']}"
+    elif auth_type == "cookie" and cfg.get("cookie"):
+        headers["Cookie"] = cfg["cookie"]
+        if cfg.get("user_token"):
+            headers["X-UserToken"] = cfg["user_token"]
+    else:
+        user = cfg.get("username", "")
+        pw = cfg.get("password", "")
+        if not user or not pw:
+            sys.stderr.write(
+                f"{Colors.RED}Error:{Colors.RESET} Missing credentials. Run '{Colors.BOLD}sn config{Colors.RESET}'.\n"
+            )
+            sys.exit(1)
+        b64 = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {b64}"
+
+    data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        try:
+            err_json = json.loads(err_body)
+            msg = err_json.get("error", {}).get("message") or err_body
+            detail = err_json.get("error", {}).get("detail") or ""
+        except Exception:
+            msg = err_body
+            detail = ""
+        sys.stderr.write(f"{Colors.RED}HTTP {e.code} Error:{Colors.RESET} {msg}\n")
+        if detail:
+            sys.stderr.write(f"Detail: {detail}\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"{Colors.RED}Connection Error:{Colors.RESET} {e.reason}\n")
+        sys.exit(1)
+
+
+def print_table(rows: List[Dict[str, Any]], fields: List[str]) -> None:
+    if not rows:
+        print("No matching tickets found.")
+        return
+
+    headers = [f.upper() for f in fields]
+    matrix: List[List[str]] = []
+    for r in rows:
+        row_vals = []
+        for f in fields:
+            val = extract_display(r.get(f, "")).replace("\n", " ").replace("\r", "")
+            if f == "short_description" and len(val) > 65:
+                val = val[:62] + "..."
+            row_vals.append(val)
+        matrix.append(row_vals)
+
+    widths = [len(h) for h in headers]
+    for row in matrix:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    header_line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    sep_line = "  ".join("-" * widths[i] for i in range(len(headers)))
+    print(f"{Colors.BOLD}{Colors.CYAN}{header_line}{Colors.RESET}")
+    print(f"{Colors.DIM}{sep_line}{Colors.RESET}")
+
+    for row in matrix:
+        formatted_cells = []
+        for i, cell in enumerate(row):
+            padded = cell.ljust(widths[i])
+            if fields[i] == "number":
+                padded = f"{Colors.BOLD}{padded}{Colors.RESET}"
+            elif fields[i] == "priority":
+                if cell.startswith("1") or "Critical" in cell:
+                    padded = f"{Colors.RED}{padded}{Colors.RESET}"
+                elif cell.startswith("2") or "High" in cell:
+                    padded = f"{Colors.YELLOW}{padded}{Colors.RESET}"
+            formatted_cells.append(padded)
+        print("  ".join(formatted_cells))
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    profile = args.profile
+    existing = load_config(profile)
+
+    print(f"{Colors.BOLD}Configuring ServiceNow CLI profile '{profile}'{Colors.RESET}")
+    default_inst = existing.get("instance", "")
+    inst_input = input(f"Instance name or URL [{default_inst}]: ").strip() or default_inst
+    instance = normalize_instance_url(inst_input)
+    if not instance:
+        print("Instance is required.")
+        sys.exit(1)
+
+    default_auth = existing.get("auth_type", "basic")
+    auth_type = (
+        input(f"Auth method (basic / token / cookie) [{default_auth}]: ").strip().lower()
+        or default_auth
+    )
+
+    profile_data: Dict[str, Any] = {
+        "instance": instance,
+        "auth_type": auth_type,
+    }
+
+    if auth_type == "token":
+        token = getpass.getpass("Bearer / OAuth Token: ").strip() or existing.get("token", "")
+        default_user = existing.get("username", "")
+        username = input(f"Your ServiceNow username (optional, for --mine) [{default_user}]: ").strip() or default_user
+        profile_data["token"] = token
+        profile_data["username"] = username
+    elif auth_type == "cookie":
+        cookie = getpass.getpass("Browser Cookie header string: ").strip() or existing.get("cookie", "")
+        user_token = input("X-UserToken (if required, optional): ").strip() or existing.get("user_token", "")
+        default_user = existing.get("username", "")
+        username = input(f"Your ServiceNow username (optional, for --mine) [{default_user}]: ").strip() or default_user
+        profile_data["cookie"] = cookie
+        profile_data["user_token"] = user_token
+        profile_data["username"] = username
+    else:
+        default_user = existing.get("username", "")
+        username = input(f"Username [{default_user}]: ").strip() or default_user
+        password = getpass.getpass("Password (leave blank to keep existing): ") or existing.get("password", "")
+        profile_data["username"] = username
+        profile_data["password"] = password
+
+    save_config(profile, profile_data)
+    print(f"{Colors.GREEN}Saved configuration to {CONFIG_PATH} (permissions 0600).{Colors.RESET}")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    cfg = load_config(args.profile)
+    table = args.table
+
+    query_parts: List[str] = []
+    if not args.all and not args.query:
+        query_parts.append("active=true")
+
+    if args.mine:
+        user = cfg.get("username")
+        if not user:
+            sys.stderr.write("Error: username not set in profile for --mine.\n")
+            sys.exit(1)
+        query_parts.append(f"assigned_to.user_name={user}")
+
+    if args.caller:
+        query_parts.append(f"caller_id.user_name={args.caller}^ORopened_by.user_name={args.caller}")
+
+    if args.group:
+        query_parts.append(f"assignment_group.nameLIKE{args.group}")
+
+    if args.state:
+        query_parts.append(f"state={args.state}")
+
+    if args.priority:
+        query_parts.append(f"priority={args.priority}")
+
+    if args.search:
+        query_parts.append(f"short_descriptionLIKE{args.search}^ORdescriptionLIKE{args.search}")
+
+    if args.query:
+        query_parts.append(args.query)
+
+    order_clause = f"ORDERBYDESC{args.sort}" if args.sort else "ORDERBYDESCsys_updated_on"
+    query_parts.append(order_clause)
+
+    final_query = "^".join(query_parts)
+    fields = [f.strip() for f in args.fields.split(",") if f.strip()] if args.fields else DEFAULT_FIELDS
+
+    params = {
+        "sysparm_query": final_query,
+        "sysparm_fields": ",".join(fields),
+        "sysparm_display_value": "true",
+        "sysparm_limit": str(args.limit),
+    }
+
+    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
+    records = res.get("result", [])
+
+    if args.output == "json":
+        print(json.dumps(records, indent=2))
+    elif args.output in ("csv", "tsv"):
+        delimiter = "\t" if args.output == "tsv" else ","
+        writer = csv.writer(sys.stdout, delimiter=delimiter)
+        writer.writerow(fields)
+        for r in records:
+            writer.writerow([extract_display(r.get(f, "")) for f in fields])
+    else:
+        print_table(records, fields)
+
+
+def cmd_get(args: argparse.Namespace) -> None:
+    cfg = load_config(args.profile)
+    ident = args.ticket.strip()
+    table = detect_table(ident, args.table)
+
+    # Check if sys_id (32 hex chars) or ticket number
+    is_sys_id = len(ident) == 32 and all(c in "0123456789abcdefABCDEF" for c in ident)
+    query = f"sys_id={ident}" if is_sys_id else f"number={ident.upper()}"
+
+    params = {
+        "sysparm_query": query,
+        "sysparm_display_value": "all",
+        "sysparm_limit": "1",
+    }
+
+    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
+    results = res.get("result", [])
+    if not results and not args.table and table != "task":
+        # Fallback to base task table
+        res = sn_request(cfg, "GET", "/api/now/table/task", params=params)
+        results = res.get("result", [])
+
+    if not results:
+        sys.stderr.write(f"{Colors.RED}Ticket '{ident}' not found.{Colors.RESET}\n")
+        sys.exit(1)
+
+    record = results[0]
+    if args.json:
+        print(json.dumps(record, indent=2))
+        return
+
+    num = extract_display(record.get("number")) or ident
+    short_desc = extract_display(record.get("short_description"))
+    state = extract_display(record.get("state"))
+    priority = extract_display(record.get("priority"))
+    assigned_to = extract_display(record.get("assigned_to")) or "Unassigned"
+    group = extract_display(record.get("assignment_group")) or "None"
+    caller = (
+        extract_display(record.get("caller_id"))
+        or extract_display(record.get("requested_for"))
+        or extract_display(record.get("opened_by"))
+    )
+    opened_at = extract_display(record.get("opened_at"))
+    updated_on = extract_display(record.get("sys_updated_on"))
+    desc = extract_display(record.get("description"))
+    close_notes = extract_display(record.get("close_notes"))
+    sys_id = record.get("sys_id", {}).get("value") if isinstance(record.get("sys_id"), dict) else record.get("sys_id")
+
+    print(f"{Colors.BOLD}{Colors.CYAN}{num}{Colors.RESET} — {Colors.BOLD}{short_desc}{Colors.RESET}")
+    print(f"{Colors.DIM}{'-' * 72}{Colors.RESET}")
+    print(f"{Colors.BOLD}Table:{Colors.RESET}            {table} (sys_id: {sys_id})")
+    print(f"{Colors.BOLD}State:{Colors.RESET}            {state}")
+    print(f"{Colors.BOLD}Priority:{Colors.RESET}         {priority}")
+    print(f"{Colors.BOLD}Caller/Opened By:{Colors.RESET} {caller}")
+    print(f"{Colors.BOLD}Assignment Group:{Colors.RESET} {group}")
+    print(f"{Colors.BOLD}Assigned To:{Colors.RESET}      {assigned_to}")
+    print(f"{Colors.BOLD}Opened:{Colors.RESET}           {opened_at}")
+    print(f"{Colors.BOLD}Last Updated:{Colors.RESET}     {updated_on}")
+    print(f"{Colors.BOLD}URL:{Colors.RESET}              {cfg['instance']}/nav_to.do?uri={table}.do?sys_id={sys_id}")
+
+    if desc:
+        print(f"\n{Colors.BOLD}Description:{Colors.RESET}")
+        print(textwrap.indent(desc.strip(), "  "))
+
+    if close_notes:
+        print(f"\n{Colors.BOLD}Close Notes:{Colors.RESET}")
+        print(textwrap.indent(close_notes.strip(), "  "))
+
+    if args.comments and sys_id:
+        j_params = {
+            "sysparm_query": f"element_id={sys_id}^ORDERBYDESCsys_created_on",
+            "sysparm_fields": "element,sys_created_on,sys_created_by,value",
+            "sysparm_display_value": "true",
+            "sysparm_limit": "20",
+        }
+        j_res = sn_request(cfg, "GET", "/api/now/table/sys_journal_field", params=j_params)
+        entries = j_res.get("result", [])
+        print(f"\n{Colors.BOLD}Comments & Work Notes ({len(entries)}):{Colors.RESET}")
+        for entry in entries:
+            el = extract_display(entry.get("element"))
+            when = extract_display(entry.get("sys_created_on"))
+            who = extract_display(entry.get("sys_created_by"))
+            val = extract_display(entry.get("value")).strip()
+            tag = "WORK NOTE" if el == "work_notes" else "COMMENT"
+            print(f"  {Colors.YELLOW}[{when}] {who} ({tag}):{Colors.RESET}")
+            print(textwrap.indent(val, "    "))
+            print()
+
+
+def cmd_comment(args: argparse.Namespace) -> None:
+    cfg = load_config(args.profile)
+    ident = args.ticket.strip()
+    table = detect_table(ident, args.table)
+
+    params = {
+        "sysparm_query": f"number={ident.upper()}",
+        "sysparm_fields": "sys_id,number",
+        "sysparm_limit": "1",
+    }
+    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
+    results = res.get("result", [])
+    if not results:
+        sys.stderr.write(f"{Colors.RED}Ticket '{ident}' not found in table '{table}'.{Colors.RESET}\n")
+        sys.exit(1)
+
+    sys_id = results[0]["sys_id"]
+    field_name = "work_notes" if args.work_note else "comments"
+    payload = {field_name: args.message}
+
+    sn_request(cfg, "PATCH", f"/api/now/table/{table}/{sys_id}", body=payload)
+    print(f"{Colors.GREEN}Added {field_name} to {ident.upper()}.{Colors.RESET}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sn",
+        description="ServiceNow CLI for querying and managing tickets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              sn config                                  # Interactive setup
+              sn get INC0010001                          # View ticket details
+              sn get INC0010001 --comments               # View ticket + comments/work notes
+              sn list --mine                             # Active tickets assigned to you
+              sn list -t incident --priority 1           # All active P1 incidents
+              sn list --group "Service Desk" -s "vpn"    # Search group tickets for 'vpn'
+              sn list -q "active=true^state=2" -o json   # Raw encoded query as JSON
+              sn comment INC0010001 "Investigating now" --work-note
+            """
+        ),
+    )
+    parser.add_argument("-p", "--profile", default="default", help="Config profile name (default: 'default')")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # sn config
+    sub.add_parser("config", help="Configure ServiceNow instance URL and credentials")
+
+    # sn get
+    p_get = sub.add_parser("get", help="Get details of a single ticket by Number or sys_id")
+    p_get.add_argument("ticket", help="Ticket number (e.g. INC0012345, RITM0012345, CHG0012345) or sys_id")
+    p_get.add_argument("-t", "--table", help="Override table name (auto-detected from prefix by default)")
+    p_get.add_argument("-c", "--comments", action="store_true", help="Include comments and work notes")
+    p_get.add_argument("--json", action="store_true", help="Output raw JSON")
+
+    # sn list / sn query
+    p_list = sub.add_parser("list", aliases=["query", "ls"], help="Query and list tickets")
+    p_list.add_argument("-t", "--table", default="task", help="Table to query (default: task, e.g. incident, sc_req_item)")
+    p_list.add_argument("-m", "--mine", action="store_true", help="Only tickets assigned to me")
+    p_list.add_argument("--caller", help="Filter by caller / opened_by username")
+    p_list.add_argument("-g", "--group", help="Filter by assignment group name (contains)")
+    p_list.add_argument("--state", help="Filter by state value")
+    p_list.add_argument("--priority", help="Filter by priority (e.g. 1, 2, 3)")
+    p_list.add_argument("-s", "--search", help="Search text in short_description or description")
+    p_list.add_argument("-q", "--query", help="Raw ServiceNow sysparm_query string")
+    p_list.add_argument("-a", "--all", action="store_true", help="Include closed/inactive tickets")
+    p_list.add_argument("-f", "--fields", help=f"Comma-separated fields (default: {','.join(DEFAULT_FIELDS)})")
+    p_list.add_argument("-l", "--limit", type=int, default=25, help="Max records to return (default: 25)")
+    p_list.add_argument("--sort", default="sys_updated_on", help="Field to sort descending by (default: sys_updated_on)")
+    p_list.add_argument("-o", "--output", choices=["table", "json", "csv", "tsv"], default="table", help="Output format")
+
+    # sn comment
+    p_comment = sub.add_parser("comment", help="Add a comment or work note to a ticket")
+    p_comment.add_argument("ticket", help="Ticket number (e.g. INC0012345)")
+    p_comment.add_argument("message", help="Comment or work note text")
+    p_comment.add_argument("-w", "--work-note", action="store_true", help="Post as internal work_notes instead of customer-visible comments")
+    p_comment.add_argument("-t", "--table", help="Override table name")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "config":
+        cmd_config(args)
+    elif args.command == "get":
+        cmd_get(args)
+    elif args.command in ("list", "query", "ls"):
+        cmd_list(args)
+    elif args.command == "comment":
+        cmd_comment(args)
+
+
+if __name__ == "__main__":
+    main()
