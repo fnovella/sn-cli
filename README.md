@@ -66,9 +66,9 @@ sn -p dev list --mine
    Sends `Authorization: Bearer <token>`.
 3. **`cookie` (Enterprise SSO / Browser Session)**
    If your organization enforces SAML/Entra ID SSO and blocks basic authentication:
-   - Open your ServiceNow instance in your browser and open DevTools (`F12` -> **Network** tab).
-   - Click any `/api/now/...` request and copy the `Cookie` request header (and `X-UserToken` header if present).
-   - Select `cookie` during `sn config` and paste the values.
+   - Open your ServiceNow instance in Chrome/Firefox and open DevTools (`F12` -> **Network** tab).
+   - Right-click any `/api/now/...` request and select **Copy** -> **Copy as cURL**.
+   - Run `sn config` (or `sn config --curl`)—it will automatically detect the `Copy as cURL` command in your clipboard (or let you paste it directly) and extract your instance URL, `Cookie`, and `X-UserToken` automatically.
 
 ### Environment Variables
 

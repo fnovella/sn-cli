@@ -9,6 +9,7 @@ require "io/console"
 require "json"
 require "net/http"
 require "optparse"
+require "shellwords"
 require "uri"
 
 begin
@@ -379,7 +380,19 @@ end
 def prompt_input(prompt_text)
   $stdout.print(prompt_text)
   $stdout.flush
-  ($stdin.gets || "").strip
+  first = $stdin.gets
+  return "" if first.nil?
+
+  lines = [first]
+  if first.lstrip.start_with?("curl ") || first.rstrip.end_with?("\\")
+    while lines.last.rstrip.end_with?("\\") || IO.select([$stdin], nil, nil, 0.05)
+      nxt = $stdin.gets
+      break if nxt.nil?
+
+      lines << nxt
+    end
+  end
+  lines.join.strip
 end
 
 def prompt_secret(prompt_text)
@@ -394,6 +407,93 @@ def prompt_secret(prompt_text)
   (val || "").strip
 end
 
+def read_clipboard_text
+  [
+    ["wl-paste", "--no-newline"],
+    ["xclip", "-selection", "clipboard", "-o"],
+    ["xsel", "--clipboard", "--output"],
+    ["pbpaste"]
+  ].each do |cmd|
+    begin
+      IO.popen(cmd, err: File::NULL) do |io|
+        out = io.read
+        Process.wait(io.pid)
+        return out.strip if $?.success? && out && !out.strip.empty?
+      end
+    rescue StandardError
+      next
+    end
+  end
+  nil
+end
+
+def parse_curl_command(text)
+  cleaned = text.to_s.gsub(/\\\r?\n/, " ").strip
+  return nil unless cleaned.match?(/\Acurl\b/i)
+
+  instance = nil
+  cookies = []
+  user_token = nil
+
+  tokens = begin
+    Shellwords.split(cleaned)
+  rescue StandardError
+    []
+  end
+
+  if !tokens.empty?
+    i = 0
+    while i < tokens.length
+      tok = tokens[i]
+      if tok =~ /\Ahttps?:\/\//i && instance.nil?
+        begin
+          u = URI.parse(tok)
+          port_part = u.port && ![80, 443].include?(u.port) ? ":#{u.port}" : ""
+          instance = "#{u.scheme}://#{u.host}#{port_part}" if u.host
+        rescue StandardError
+          # Ignore malformed URI
+        end
+      elsif %w[-b --cookie].include?(tok) && (i + 1) < tokens.length
+        cookies << tokens[i + 1]
+        i += 1
+      elsif %w[-H --header].include?(tok) && (i + 1) < tokens.length
+        hdr = tokens[i + 1]
+        if hdr =~ /\Acookie:\s*(.+)\z/i
+          cookies << Regexp.last_match(1).strip
+        elsif hdr =~ /\Ax-usertoken:\s*(.+)\z/i
+          user_token = Regexp.last_match(1).strip
+        end
+        i += 1
+      end
+      i += 1
+    end
+  end
+
+  # Regex fallbacks in case shell quote escaping was non-standard or truncated
+  if instance.nil? && cleaned =~ /(https?:\/\/[^\s'"]+)/i
+    begin
+      u = URI.parse(Regexp.last_match(1))
+      port_part = u.port && ![80, 443].include?(u.port) ? ":#{u.port}" : ""
+      instance = "#{u.scheme}://#{u.host}#{port_part}" if u.host
+    rescue StandardError
+      # Ignore
+    end
+  end
+  if cookies.empty?
+    cleaned.scan(/(?:-b|--cookie)\s+(['"])(.*?)\1/m) { |_, val| cookies << val }
+    cleaned.scan(/(?:-H|--header)\s+(['"])cookie:\s*(.*?)\1/im) { |_, val| cookies << val.strip }
+  end
+  if user_token.nil? && cleaned =~ /(?:-H|--header)\s+['"]?x-usertoken:\s*([^'"\s]+)/i
+    user_token = Regexp.last_match(1).strip
+  end
+
+  {
+    "instance"   => instance,
+    "cookie"     => cookies.join("; "),
+    "user_token" => user_token
+  }
+end
+
 # ---------------------------------------------------------------------------
 # Commands: Config & Tickets
 # ---------------------------------------------------------------------------
@@ -403,9 +503,70 @@ def cmd_config(options)
   existing = load_config(profile)
 
   puts "#{Colors::BOLD}Configuring ServiceNow CLI profile '#{profile}'#{Colors::RESET}"
+
+  # Check if user passed --curl or has a 'Copy as cURL' command in clipboard
+  clip_text = read_clipboard_text
+  clip_curl = parse_curl_command(clip_text) if clip_text
+
+  if options[:curl] && clip_curl
+    puts "#{Colors::CYAN}Imported 'Copy as cURL' from clipboard (#{clip_curl['instance']}).#{Colors::RESET}"
+    parsed_curl = clip_curl
+  elsif clip_curl && clip_curl["instance"] && !clip_curl["cookie"].to_s.empty?
+    ans = prompt_input(
+      "#{Colors::CYAN}Detected 'Copy as cURL' for #{Colors::BOLD}#{clip_curl['instance']}#{Colors::RESET}#{Colors::CYAN} in clipboard. Import it? [Y/n]: #{Colors::RESET}"
+    ).downcase
+    parsed_curl = clip_curl if ans.empty? || ans.start_with?("y")
+  end
+
+  if parsed_curl
+    instance = parsed_curl["instance"] || existing.fetch("instance", "")
+    if instance.empty?
+      inst_input = prompt_input("Instance name or URL: ")
+      instance = normalize_instance_url(inst_input)
+    end
+    default_user = existing.fetch("username", "")
+    username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
+    username = default_user if username.empty?
+
+    profile_data = {
+      "instance"   => instance,
+      "auth_type"  => "cookie",
+      "cookie"     => parsed_curl["cookie"],
+      "user_token" => parsed_curl["user_token"].to_s,
+      "username"   => username
+    }
+    save_config(profile, profile_data)
+    puts "#{Colors::GREEN}Saved cookie configuration for #{instance} to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+    return
+  end
+
   default_inst = existing.fetch("instance", "")
-  inst_input = prompt_input("Instance name or URL [#{default_inst}]: ")
+  inst_input = prompt_input("Instance name, URL, or paste 'Copy as cURL' [#{default_inst}]: ")
   inst_input = default_inst if inst_input.empty?
+
+  inline_curl = parse_curl_command(inst_input)
+  if inline_curl
+    instance = inline_curl["instance"] || normalize_instance_url(default_inst)
+    if instance.empty?
+      puts "Instance is required."
+      exit 1
+    end
+    default_user = existing.fetch("username", "")
+    username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
+    username = default_user if username.empty?
+
+    profile_data = {
+      "instance"   => instance,
+      "auth_type"  => "cookie",
+      "cookie"     => inline_curl["cookie"],
+      "user_token" => inline_curl["user_token"].to_s,
+      "username"   => username
+    }
+    save_config(profile, profile_data)
+    puts "#{Colors::GREEN}Saved cookie configuration for #{instance} to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+    return
+  end
+
   instance = normalize_instance_url(inst_input)
   if instance.empty?
     puts "Instance is required."
@@ -413,8 +574,9 @@ def cmd_config(options)
   end
 
   default_auth = existing.fetch("auth_type", "basic")
-  auth_type = prompt_input("Auth method (basic / token / cookie) [#{default_auth}]: ").downcase
+  auth_type = prompt_input("Auth method (basic / token / cookie / curl) [#{default_auth}]: ").downcase
   auth_type = default_auth if auth_type.empty?
+  auth_type = "cookie" if auth_type == "curl"
 
   profile_data = {
     "instance"  => instance,
@@ -431,10 +593,28 @@ def cmd_config(options)
     profile_data["token"] = token
     profile_data["username"] = username
   when "cookie"
-    cookie = prompt_secret("Browser Cookie header string: ")
-    cookie = existing.fetch("cookie", "") if cookie.empty?
-    user_token = prompt_input("X-UserToken (if required, optional): ")
-    user_token = existing.fetch("user_token", "") if user_token.empty?
+    puts "#{Colors::DIM}Tip: Right-click any /api/now/... request in Chrome DevTools -> Copy -> Copy as cURL, then paste below (or type 'clip' to read from clipboard).#{Colors::RESET}"
+    raw_input = prompt_input("Paste 'Copy as cURL', Cookie header string, or 'clip': ")
+    raw_input = read_clipboard_text.to_s if %w[clip clipboard].include?(raw_input.downcase)
+
+    curl_data = parse_curl_command(raw_input)
+    if curl_data && !curl_data["cookie"].to_s.empty?
+      cookie = curl_data["cookie"]
+      user_token = curl_data["user_token"].to_s
+      puts "#{Colors::GREEN}Extracted Cookie#{user_token.empty? ? '' : ' and X-UserToken'} from cURL command.#{Colors::RESET}"
+      if user_token.empty?
+        user_token = prompt_input("X-UserToken (if required, optional): ")
+        user_token = existing.fetch("user_token", "") if user_token.empty?
+      end
+    else
+      cookie = raw_input.sub(/\Acookie:\s*/i, "").strip
+      cookie = existing.fetch("cookie", "") if cookie.empty?
+      default_ut = existing.fetch("user_token", "")
+      ut_prompt = default_ut.empty? ? "X-UserToken (if required, optional): " : "X-UserToken [keep existing]: "
+      user_token = prompt_input(ut_prompt).sub(/\Ax-usertoken:\s*/i, "").strip
+      user_token = default_ut if user_token.empty?
+    end
+
     default_user = existing.fetch("username", "")
     username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
     username = default_user if username.empty?
@@ -1126,8 +1306,9 @@ def main
   case command
   when "config"
     parser = OptionParser.new do |opts|
-      opts.banner = "usage: sn config [-h] [-p PROFILE]"
+      opts.banner = "usage: sn config [-h] [-p PROFILE] [--curl]"
       add_profile_opt(opts, options)
+      opts.on("--curl", "Import instance, Cookie, and X-UserToken directly from a 'Copy as cURL' command in clipboard") { options[:curl] = true }
     end
     parse_with_errors(parser, args)
     cmd_config(options)
