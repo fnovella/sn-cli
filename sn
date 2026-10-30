@@ -1,1111 +1,1296 @@
-#!/usr/bin/env python3
-"""
-sn - Standalone ServiceNow CLI for querying, creating, and updating tickets and CMDB items.
-Zero external dependencies (uses Python 3 standard library only).
-"""
+#!/usr/bin/env ruby
+# frozen_string_literal: true
 
-import argparse
-import base64
-import csv
-import getpass
-import json
-import os
-import sys
-import textwrap
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+# sn - Standalone ServiceNow CLI for querying, creating, and updating tickets and CMDB items.
+# Zero external dependencies (uses Ruby standard library only).
 
-CONFIG_PATH = Path.home() / ".config" / "servicenow" / "config.json"
+require "fileutils"
+require "io/console"
+require "json"
+require "net/http"
+require "optparse"
+require "uri"
+
+begin
+  require "csv"
+rescue LoadError
+  # Fallback if csv gem is not installed in minimal Ruby environments
+end
+
+CONFIG_PATH = File.join(Dir.home, ".config", "servicenow", "config.json")
 
 PREFIX_TABLE_MAP = {
-    "INC": "incident",
-    "RITM": "sc_req_item",
-    "REQ": "sc_request",
-    "SCTASK": "sc_task",
-    "CHG": "change_request",
-    "CTASK": "change_task",
-    "PRB": "problem",
-    "PTASK": "problem_task",
-    "KB": "kb_knowledge",
-    "TASK": "task",
-}
+  "INC"    => "incident",
+  "RITM"   => "sc_req_item",
+  "REQ"    => "sc_request",
+  "SCTASK" => "sc_task",
+  "CHG"    => "change_request",
+  "CTASK"  => "change_task",
+  "PRB"    => "problem",
+  "PTASK"  => "problem_task",
+  "KB"     => "kb_knowledge",
+  "TASK"   => "task"
+}.freeze
 
 CMDB_CLASS_ALIASES = {
-    "ci": "cmdb_ci",
-    "server": "cmdb_ci_server",
-    "linux": "cmdb_ci_linux_server",
-    "win": "cmdb_ci_win_server",
-    "windows": "cmdb_ci_win_server",
-    "computer": "cmdb_ci_computer",
-    "pc": "cmdb_ci_pc_hardware",
-    "vm": "cmdb_ci_vm_instance",
-    "netgear": "cmdb_ci_netgear",
-    "switch": "cmdb_ci_ip_switch",
-    "router": "cmdb_ci_ip_router",
-    "firewall": "cmdb_ci_ip_firewall",
-    "app": "cmdb_ci_appl",
-    "service": "cmdb_ci_service",
-    "db": "cmdb_ci_database",
-}
+  "ci"       => "cmdb_ci",
+  "server"   => "cmdb_ci_server",
+  "linux"    => "cmdb_ci_linux_server",
+  "win"      => "cmdb_ci_win_server",
+  "windows"  => "cmdb_ci_win_server",
+  "computer" => "cmdb_ci_computer",
+  "pc"       => "cmdb_ci_pc_hardware",
+  "vm"       => "cmdb_ci_vm_instance",
+  "netgear"  => "cmdb_ci_netgear",
+  "switch"   => "cmdb_ci_ip_switch",
+  "router"   => "cmdb_ci_ip_router",
+  "firewall" => "cmdb_ci_ip_firewall",
+  "app"      => "cmdb_ci_appl",
+  "service"  => "cmdb_ci_service",
+  "db"       => "cmdb_ci_database"
+}.freeze
 
-DEFAULT_TICKET_FIELDS = [
-    "number",
-    "sys_class_name",
-    "state",
-    "priority",
-    "assigned_to",
-    "assignment_group",
-    "sys_updated_on",
-    "short_description",
-]
+DEFAULT_TICKET_FIELDS = %w[
+  number
+  sys_class_name
+  state
+  priority
+  assigned_to
+  assignment_group
+  sys_updated_on
+  short_description
+].freeze
 
-DEFAULT_CMDB_FIELDS = [
-    "name",
-    "sys_class_name",
-    "ip_address",
-    "serial_number",
-    "operational_status",
-    "assigned_to",
-    "sys_updated_on",
-]
+DEFAULT_CMDB_FIELDS = %w[
+  name
+  sys_class_name
+  ip_address
+  serial_number
+  operational_status
+  assigned_to
+  sys_updated_on
+].freeze
 
+module Colors
+  ENABLED = $stdout.tty? && ENV["NO_COLOR"].nil?
+  BOLD    = ENABLED ? "\e[1m"  : ""
+  DIM     = ENABLED ? "\e[2m"  : ""
+  CYAN    = ENABLED ? "\e[36m" : ""
+  GREEN   = ENABLED ? "\e[32m" : ""
+  YELLOW  = ENABLED ? "\e[33m" : ""
+  RED     = ENABLED ? "\e[31m" : ""
+  RESET   = ENABLED ? "\e[0m"  : ""
+end
 
-class Colors:
-    ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
-    BOLD = "\033[1m" if ENABLED else ""
-    DIM = "\033[2m" if ENABLED else ""
-    CYAN = "\033[36m" if ENABLED else ""
-    GREEN = "\033[32m" if ENABLED else ""
-    YELLOW = "\033[33m" if ENABLED else ""
-    RED = "\033[31m" if ENABLED else ""
-    RESET = "\033[0m" if ENABLED else ""
+def normalize_instance_url(instance)
+  inst = instance.to_s.strip.sub(%r{/+\z}, "")
+  return "" if inst.empty?
 
+  unless inst.start_with?("http://", "https://")
+    inst = inst.include?(".") ? "https://#{inst}" : "https://#{inst}.service-now.com"
+  end
+  inst
+end
 
-def normalize_instance_url(instance: str) -> str:
-    instance = instance.strip().rstrip("/")
-    if not instance:
-        return ""
-    if not instance.startswith("http://") and not instance.startswith("https://"):
-        if "." not in instance:
-            instance = f"https://{instance}.service-now.com"
-        else:
-            instance = f"https://{instance}"
-    return instance
+def resolve_cmdb_class(cls_name, default: "cmdb_ci")
+  return default if cls_name.nil? || cls_name.strip.empty?
 
+  key = cls_name.strip.downcase
+  CMDB_CLASS_ALIASES.fetch(key, cls_name.strip)
+end
 
-def resolve_cmdb_class(cls_name: Optional[str], default: str = "cmdb_ci") -> str:
-    if not cls_name:
-        return default
-    key = cls_name.strip().lower()
-    return CMDB_CLASS_ALIASES.get(key, cls_name.strip())
+def sys_id?(ident)
+  ident.is_a?(String) && ident.match?(/\A[0-9a-fA-F]{32}\z/)
+end
 
+def indent_text(text, prefix = "  ")
+  text.to_s.lines.map { |line| line.strip.empty? ? "\n" : "#{prefix}#{line}" }.join
+end
 
-def is_sys_id(ident: str) -> bool:
-    return len(ident) == 32 and all(c in "0123456789abcdefABCDEF" for c in ident)
+def parse_kv_and_json(set_list, json_str)
+  payload = {}
+  if json_str && !json_str.empty?
+    begin
+      parsed = JSON.parse(json_str)
+      raise "JSON payload must be an object/dictionary" unless parsed.is_a?(Hash)
 
+      payload.merge!(parsed)
+    rescue StandardError => e
+      $stderr.puts "#{Colors::RED}Invalid --data JSON:#{Colors::RESET} #{e.message}"
+      exit 1
+    end
+  end
 
-def parse_kv_And_json(set_list: Optional[List[str]], json_str: Optional[str]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-    if json_str:
-        try:
-            parsed = json.loads(json_str)
-            if not isinstance(parsed, dict):
-                raise ValueError("JSON payload must be an object/dictionary")
-            payload.update(parsed)
-        except Exception as e:
-            sys.stderr.write(f"{Colors.RED}Invalid --data JSON:{Colors.RESET} {e}\n")
-            sys.exit(1)
+  Array(set_list).each do |item|
+    unless item.include?("=")
+      $stderr.puts "#{Colors::RED}Invalid --set argument '#{item}':#{Colors::RESET} Expected KEY=VALUE format."
+      exit 1
+    end
+    k, v = item.split("=", 2)
+    payload[k.strip] = v
+  end
+  payload
+end
 
-    if set_list:
-        for item in set_list:
-            if "=" not in item:
-                sys.stderr.write(
-                    f"{Colors.RED}Invalid --set argument '{item}':{Colors.RESET} Expected KEY=VALUE format.\n"
-                )
-                sys.exit(1)
-            k, v = item.split("=", 1)
-            payload[k.strip()] = v
-    return payload
+def load_config(profile = "default")
+  cfg = {}
+  if File.exist?(CONFIG_PATH)
+    begin
+      data = JSON.parse(File.read(CONFIG_PATH, encoding: "utf-8"))
+      profiles = data["profiles"] || {}
+      active = profile != "default" ? profile : (data["default_profile"] || "default")
+      cfg = (profiles[active] || {}).dup
+    rescue StandardError => e
+      $stderr.puts "Warning: could not read #{CONFIG_PATH}: #{e.message}"
+    end
+  end
 
+  # Environment variable overrides
+  cfg["instance"] = normalize_instance_url(ENV["SN_INSTANCE"]) if ENV["SN_INSTANCE"] && !ENV["SN_INSTANCE"].empty?
+  cfg["username"] = ENV["SN_USER"] if ENV["SN_USER"] && !ENV["SN_USER"].empty?
+  if ENV["SN_PASS"] && !ENV["SN_PASS"].empty?
+    cfg["password"] = ENV["SN_PASS"]
+    cfg["auth_type"] ||= "basic"
+  end
+  if ENV["SN_TOKEN"] && !ENV["SN_TOKEN"].empty?
+    cfg["token"] = ENV["SN_TOKEN"]
+    cfg["auth_type"] = "token"
+  end
 
-def load_config(profile: str = "default") -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {}
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                profiles = data.get("profiles", {})
-                active = profile if profile != "default" else data.get("default_profile", "default")
-                cfg = profiles.get(active, {})
-        except Exception as e:
-            sys.stderr.write(f"Warning: could not read {CONFIG_PATH}: {e}\n")
+  cfg
+end
 
-    # Environment variable overrides
-    if os.environ.get("SN_INSTANCE"):
-        cfg["instance"] = normalize_instance_url(os.environ["SN_INSTANCE"])
-    if os.environ.get("SN_USER"):
-        cfg["username"] = os.environ["SN_USER"]
-    if os.environ.get("SN_PASS"):
-        cfg["password"] = os.environ["SN_PASS"]
-        cfg.setdefault("auth_type", "basic")
-    if os.environ.get("SN_TOKEN"):
-        cfg["token"] = os.environ["SN_TOKEN"]
-        cfg["auth_type"] = "token"
+def save_config(profile, profile_data)
+  FileUtils.mkdir_p(File.dirname(CONFIG_PATH))
+  data = { "default_profile" => profile, "profiles" => {} }
+  if File.exist?(CONFIG_PATH)
+    begin
+      data = JSON.parse(File.read(CONFIG_PATH, encoding: "utf-8"))
+    rescue StandardError
+      # Ignore malformed existing file
+    end
+  end
+  data["profiles"] ||= {}
+  data["profiles"][profile] = profile_data
+  data["default_profile"] = profile
 
-    return cfg
+  File.write(CONFIG_PATH, "#{JSON.pretty_generate(data)}\n", encoding: "utf-8")
+  File.chmod(0o600, CONFIG_PATH)
+end
 
+def detect_table(identifier, explicit_table = nil)
+  return explicit_table if explicit_table && !explicit_table.empty?
 
-def save_config(profile: str, profile_data: Dict[str, Any]) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    data: Dict[str, Any] = {"default_profile": profile, "profiles": {}}
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
-    data.setdefault("profiles", {})[profile] = profile_data
-    data["default_profile"] = profile
+  upper = identifier.to_s.upcase
+  PREFIX_TABLE_MAP.keys.sort_by { |k| -k.length }.each do |prefix|
+    return PREFIX_TABLE_MAP[prefix] if upper.start_with?(prefix)
+  end
+  "task"
+end
 
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(CONFIG_PATH, 0o600)
+def extract_display(val)
+  return "" if val.nil?
 
+  if val.is_a?(Hash)
+    res = val["display_value"]
+    res = val["value"] if res.nil? || res.to_s.empty?
+    return res.to_s
+  end
+  val.to_s
+end
 
-def detect_table(identifier: str, explicit_table: Optional[str] = None) -> str:
-    if explicit_table:
-        return explicit_table
-    upper = identifier.upper()
-    for prefix, table in sorted(PREFIX_TABLE_MAP.items(), key=lambda x: -len(x[0])):
-        if upper.startswith(prefix):
-            return table
-    return "task"
+def extract_raw_value(val)
+  return "" if val.nil?
 
+  if val.is_a?(Hash)
+    res = val["value"]
+    res = val["display_value"] if res.nil? || res.to_s.empty?
+    return res.to_s
+  end
+  val.to_s
+end
 
-def extract_display(val: Any) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, dict):
-        return str(val.get("display_value") or val.get("value") or "")
-    return str(val)
+def sn_request(cfg, method, path, params: nil, body: nil)
+  instance = cfg["instance"]
+  if instance.nil? || instance.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} ServiceNow instance not configured."
+    $stderr.puts "Run '#{Colors::BOLD}sn config#{Colors::RESET}' or set SN_INSTANCE, SN_USER, SN_PASS."
+    exit 1
+  end
 
+  url_str = "#{instance.sub(%r{/+\z}, '')}/#{path.sub(%r{\A/+}, '')}"
+  if params && !params.empty?
+    query_string = URI.encode_www_form(params)
+    url_str = "#{url_str}?#{query_string}"
+  end
 
-def extract_raw_value(val: Any) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, dict):
-        return str(val.get("value") or val.get("display_value") or "")
-    return str(val)
+  uri = URI.parse(url_str)
+  req_class = case method.to_s.upcase
+              when "GET"    then Net::HTTP::Get
+              when "POST"   then Net::HTTP::Post
+              when "PATCH"  then Net::HTTP::Patch
+              when "PUT"    then Net::HTTP::Put
+              when "DELETE" then Net::HTTP::Delete
+              else raise ArgumentError, "Unsupported HTTP method: #{method}"
+              end
 
+  req = req_class.new(uri)
+  req["Accept"] = "application/json"
+  req["Content-Type"] = "application/json"
+  req["User-Agent"] = "sn-cli/1.1 (ruby)"
 
-def sn_request(
-    cfg: Dict[str, Any],
-    method: str,
-    path: str,
-    params: Optional[Dict[str, str]] = None,
-    body: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    instance = cfg.get("instance")
-    if not instance:
-        sys.stderr.write(
-            f"{Colors.RED}Error:{Colors.RESET} ServiceNow instance not configured.\n"
-            f"Run '{Colors.BOLD}sn config{Colors.RESET}' or set SN_INSTANCE, SN_USER, SN_PASS.\n"
-        )
-        sys.exit(1)
+  auth_type = cfg.fetch("auth_type", "basic")
+  if auth_type == "token" && cfg["token"] && !cfg["token"].empty?
+    req["Authorization"] = "Bearer #{cfg['token']}"
+  elsif auth_type == "cookie" && cfg["cookie"] && !cfg["cookie"].empty?
+    req["Cookie"] = cfg["cookie"]
+    req["X-UserToken"] = cfg["user_token"] if cfg["user_token"] && !cfg["user_token"].empty?
+  else
+    user = cfg["username"].to_s
+    pw = cfg["password"].to_s
+    if user.empty? || pw.empty?
+      $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Missing credentials. Run '#{Colors::BOLD}sn config#{Colors::RESET}'."
+      exit 1
+    end
+    b64 = ["#{user}:#{pw}"].pack("m0")
+    req["Authorization"] = "Basic #{b64}"
+  end
 
-    url = f"{instance.rstrip('/')}/{path.lstrip('/')}"
-    if params:
-        query_string = urllib.parse.urlencode(params)
-        url = f"{url}?{query_string}"
+  req.body = JSON.generate(body) unless body.nil?
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "sn-cli/1.1",
-    }
+  begin
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == "https")
+    http.open_timeout = 30
+    http.read_timeout = 30
 
-    auth_type = cfg.get("auth_type", "basic")
-    if auth_type == "token" and cfg.get("token"):
-        headers["Authorization"] = f"Bearer {cfg['token']}"
-    elif auth_type == "cookie" and cfg.get("cookie"):
-        headers["Cookie"] = cfg["cookie"]
-        if cfg.get("user_token"):
-            headers["X-UserToken"] = cfg["user_token"]
-    else:
-        user = cfg.get("username", "")
-        pw = cfg.get("password", "")
-        if not user or not pw:
-            sys.stderr.write(
-                f"{Colors.RED}Error:{Colors.RESET} Missing credentials. Run '{Colors.BOLD}sn config{Colors.RESET}'.\n"
-            )
-            sys.exit(1)
-        b64 = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {b64}"
+    resp = http.request(req)
+    code = resp.code.to_i
+    raw = resp.body.to_s
 
-    data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+    if code >= 200 && code < 300
+      return raw.empty? ? {} : JSON.parse(raw)
+    else
+      begin
+        err_json = JSON.parse(raw)
+        err_obj = err_json["error"].is_a?(Hash) ? err_json["error"] : {}
+        msg = err_obj["message"] || raw
+        detail = err_obj["detail"].to_s
+      rescue StandardError
+        msg = raw
+        detail = ""
+      end
+      $stderr.puts "#{Colors::RED}HTTP #{code} Error:#{Colors::RESET} #{msg}"
+      $stderr.puts "Detail: #{detail}" unless detail.empty?
+      exit 1
+    end
+  rescue StandardError => e
+    $stderr.puts "#{Colors::RED}Connection Error:#{Colors::RESET} #{e.message}"
+    exit 1
+  end
+end
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        try:
-            err_json = json.loads(err_body)
-            msg = err_json.get("error", {}).get("message") or err_body
-            detail = err_json.get("error", {}).get("detail") or ""
-        except Exception:
-            msg = err_body
-            detail = ""
-        sys.stderr.write(f"{Colors.RED}HTTP {e.code} Error:{Colors.RESET} {msg}\n")
-        if detail:
-            sys.stderr.write(f"Detail: {detail}\n")
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        sys.stderr.write(f"{Colors.RED}Connection Error:{Colors.RESET} {e.reason}\n")
-        sys.exit(1)
+def format_delimited_row(values, delimiter)
+  if defined?(CSV)
+    CSV.generate_line(values, col_sep: delimiter)
+  else
+    values.map do |v|
+      s = v.to_s
+      if s.include?(delimiter) || s.include?('"') || s.include?("\n") || s.include?("\r")
+        "\"#{s.gsub('"', '""')}\""
+      else
+        s
+      end
+    end.join(delimiter) + "\n"
+  end
+end
 
+def print_table(rows, fields, empty_msg: "No matching records found.")
+  if rows.nil? || rows.empty?
+    puts empty_msg
+    return
+  end
 
-def print_table(rows: List[Dict[str, Any]], fields: List[str], empty_msg: str = "No matching records found.") -> None:
-    if not rows:
-        print(empty_msg)
-        return
+  headers = fields.map(&:upcase)
+  matrix = rows.map do |r|
+    fields.map do |f|
+      val = extract_display(r[f]).gsub("\n", " ").delete("\r")
+      val = "#{val[0, 62]}..." if %w[short_description description].include?(f) && val.length > 65
+      val
+    end
+  end
 
-    headers = [f.upper() for f in fields]
-    matrix: List[List[str]] = []
-    for r in rows:
-        row_vals = []
-        for f in fields:
-            val = extract_display(r.get(f, "")).replace("\n", " ").replace("\r", "")
-            if f in ("short_description", "description") and len(val) > 65:
-                val = val[:62] + "..."
-            row_vals.append(val)
-        matrix.append(row_vals)
+  widths = headers.map(&:length)
+  matrix.each do |row|
+    row.each_with_index do |cell, i|
+      widths[i] = [widths[i], cell.length].max
+    end
+  end
 
-    widths = [len(h) for h in headers]
-    for row in matrix:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+  header_line = headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  ")
+  sep_line = widths.map { |w| "-" * w }.join("  ")
+  puts "#{Colors::BOLD}#{Colors::CYAN}#{header_line}#{Colors::RESET}"
+  puts "#{Colors::DIM}#{sep_line}#{Colors::RESET}"
 
-    header_line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    sep_line = "  ".join("-" * widths[i] for i in range(len(headers)))
-    print(f"{Colors.BOLD}{Colors.CYAN}{header_line}{Colors.RESET}")
-    print(f"{Colors.DIM}{sep_line}{Colors.RESET}")
+  matrix.each do |row|
+    formatted_cells = row.each_with_index.map do |cell, i|
+      padded = cell.ljust(widths[i])
+      if %w[number name].include?(fields[i])
+        "#{Colors::BOLD}#{padded}#{Colors::RESET}"
+      elsif fields[i] == "priority"
+        if cell.start_with?("1") || cell.include?("Critical")
+          "#{Colors::RED}#{padded}#{Colors::RESET}"
+        elsif cell.start_with?("2") || cell.include?("High")
+          "#{Colors::YELLOW}#{padded}#{Colors::RESET}"
+        else
+          padded
+        end
+      else
+        padded
+      end
+    end
+    puts formatted_cells.join("  ")
+  end
+end
 
-    for row in matrix:
-        formatted_cells = []
-        for i, cell in enumerate(row):
-            padded = cell.ljust(widths[i])
-            if fields[i] in ("number", "name"):
-                padded = f"{Colors.BOLD}{padded}{Colors.RESET}"
-            elif fields[i] == "priority":
-                if cell.startswith("1") or "Critical" in cell:
-                    padded = f"{Colors.RED}{padded}{Colors.RESET}"
-                elif cell.startswith("2") or "High" in cell:
-                    padded = f"{Colors.YELLOW}{padded}{Colors.RESET}"
-            formatted_cells.append(padded)
-        print("  ".join(formatted_cells))
+def resolve_ticket_sys_id(cfg, ident, table)
+  return ident if sys_id?(ident)
 
+  params = {
+    "sysparm_query"  => "number=#{ident.upcase}",
+    "sysparm_fields" => "sys_id,number",
+    "sysparm_limit"  => "1"
+  }
+  res = sn_request(cfg, "GET", "/api/now/table/#{table}", params: params)
+  results = res["result"] || []
+  if results.empty? && table != "task"
+    res = sn_request(cfg, "GET", "/api/now/table/task", params: params)
+    results = res["result"] || []
+  end
+  if results.empty?
+    $stderr.puts "#{Colors::RED}Ticket '#{ident}' not found.#{Colors::RESET}"
+    exit 1
+  end
+  extract_raw_value(results[0]["sys_id"])
+end
 
-def resolve_ticket_sys_id(cfg: Dict[str, Any], ident: str, table: str) -> str:
-    if is_sys_id(ident):
-        return ident
-    params = {
-        "sysparm_query": f"number={ident.upper()}",
-        "sysparm_fields": "sys_id,number",
-        "sysparm_limit": "1",
-    }
-    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
-    results = res.get("result", [])
-    if not results and table != "task":
-        res = sn_request(cfg, "GET", "/api/now/table/task", params=params)
-        results = res.get("result", [])
-    if not results:
-        sys.stderr.write(f"{Colors.RED}Ticket '{ident}' not found.{Colors.RESET}\n")
-        sys.exit(1)
-    return extract_raw_value(results[0].get("sys_id"))
+def prompt_input(prompt_text)
+  $stdout.print(prompt_text)
+  $stdout.flush
+  ($stdin.gets || "").strip
+end
 
+def prompt_secret(prompt_text)
+  $stdout.print(prompt_text)
+  $stdout.flush
+  val = if $stdin.tty?
+          $stdin.noecho(&:gets)
+        else
+          $stdin.gets
+        end
+  puts
+  (val || "").strip
+end
 
 # ---------------------------------------------------------------------------
 # Commands: Config & Tickets
 # ---------------------------------------------------------------------------
 
+def cmd_config(options)
+  profile = options[:profile]
+  existing = load_config(profile)
 
-def cmd_config(args: argparse.Namespace) -> None:
-    profile = args.profile
-    existing = load_config(profile)
+  puts "#{Colors::BOLD}Configuring ServiceNow CLI profile '#{profile}'#{Colors::RESET}"
+  default_inst = existing.fetch("instance", "")
+  inst_input = prompt_input("Instance name or URL [#{default_inst}]: ")
+  inst_input = default_inst if inst_input.empty?
+  instance = normalize_instance_url(inst_input)
+  if instance.empty?
+    puts "Instance is required."
+    exit 1
+  end
 
-    print(f"{Colors.BOLD}Configuring ServiceNow CLI profile '{profile}'{Colors.RESET}")
-    default_inst = existing.get("instance", "")
-    inst_input = input(f"Instance name or URL [{default_inst}]: ").strip() or default_inst
-    instance = normalize_instance_url(inst_input)
-    if not instance:
-        print("Instance is required.")
-        sys.exit(1)
+  default_auth = existing.fetch("auth_type", "basic")
+  auth_type = prompt_input("Auth method (basic / token / cookie) [#{default_auth}]: ").downcase
+  auth_type = default_auth if auth_type.empty?
 
-    default_auth = existing.get("auth_type", "basic")
-    auth_type = (
-        input(f"Auth method (basic / token / cookie) [{default_auth}]: ").strip().lower()
-        or default_auth
-    )
+  profile_data = {
+    "instance"  => instance,
+    "auth_type" => auth_type
+  }
 
-    profile_data: Dict[str, Any] = {
-        "instance": instance,
-        "auth_type": auth_type,
+  case auth_type
+  when "token"
+    token = prompt_secret("Bearer / OAuth Token: ")
+    token = existing.fetch("token", "") if token.empty?
+    default_user = existing.fetch("username", "")
+    username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
+    username = default_user if username.empty?
+    profile_data["token"] = token
+    profile_data["username"] = username
+  when "cookie"
+    cookie = prompt_secret("Browser Cookie header string: ")
+    cookie = existing.fetch("cookie", "") if cookie.empty?
+    user_token = prompt_input("X-UserToken (if required, optional): ")
+    user_token = existing.fetch("user_token", "") if user_token.empty?
+    default_user = existing.fetch("username", "")
+    username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
+    username = default_user if username.empty?
+    profile_data["cookie"] = cookie
+    profile_data["user_token"] = user_token
+    profile_data["username"] = username
+  else
+    default_user = existing.fetch("username", "")
+    username = prompt_input("Username [#{default_user}]: ")
+    username = default_user if username.empty?
+    password = prompt_secret("Password (leave blank to keep existing): ")
+    password = existing.fetch("password", "") if password.empty?
+    profile_data["username"] = username
+    profile_data["password"] = password
+  end
+
+  save_config(profile, profile_data)
+  puts "#{Colors::GREEN}Saved configuration to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+end
+
+def cmd_list(options)
+  cfg = load_config(options[:profile])
+  table = options[:table] || "task"
+
+  query_parts = []
+  query_parts << "active=true" if !options[:all] && (options[:query].nil? || options[:query].empty?)
+
+  if options[:mine]
+    user = cfg["username"]
+    if user.nil? || user.empty?
+      $stderr.puts "Error: username not set in profile for --mine."
+      exit 1
+    end
+    query_parts << "assigned_to.user_name=#{user}"
+  end
+
+  query_parts << "caller_id.user_name=#{options[:caller]}^ORopened_by.user_name=#{options[:caller]}" if options[:caller]
+  query_parts << "assignment_group.nameLIKE#{options[:group]}" if options[:group]
+  query_parts << "state=#{options[:state]}" if options[:state]
+  query_parts << "priority=#{options[:priority]}" if options[:priority]
+  query_parts << "short_descriptionLIKE#{options[:search]}^ORdescriptionLIKE#{options[:search]}" if options[:search]
+  query_parts << options[:query] if options[:query] && !options[:query].empty?
+
+  sort_field = options[:sort] && !options[:sort].empty? ? options[:sort] : "sys_updated_on"
+  query_parts << "ORDERBYDESC#{sort_field}"
+
+  final_query = query_parts.join("^")
+  fields = if options[:fields] && !options[:fields].empty?
+             options[:fields].split(",").map(&:strip).reject(&:empty?)
+           else
+             DEFAULT_TICKET_FIELDS
+           end
+
+  params = {
+    "sysparm_query"         => final_query,
+    "sysparm_fields"        => fields.join(","),
+    "sysparm_display_value" => "true",
+    "sysparm_limit"         => (options[:limit] || 25).to_s
+  }
+
+  res = sn_request(cfg, "GET", "/api/now/table/#{table}", params: params)
+  records = res["result"] || []
+
+  case options[:output]
+  when "json"
+    puts JSON.pretty_generate(records)
+  when "csv", "tsv"
+    delimiter = options[:output] == "tsv" ? "\t" : ","
+    $stdout.write(format_delimited_row(fields, delimiter))
+    records.each do |r|
+      $stdout.write(format_delimited_row(fields.map { |f| extract_display(r[f]) }, delimiter))
+    end
+  else
+    print_table(records, fields, empty_msg: "No matching tickets found.")
+  end
+end
+
+def cmd_get(options)
+  cfg = load_config(options[:profile])
+  ident = options[:ticket].strip
+  table = detect_table(ident, options[:table])
+
+  query = sys_id?(ident) ? "sys_id=#{ident}" : "number=#{ident.upcase}"
+
+  params = {
+    "sysparm_query"         => query,
+    "sysparm_display_value" => "all",
+    "sysparm_limit"         => "1"
+  }
+
+  res = sn_request(cfg, "GET", "/api/now/table/#{table}", params: params)
+  results = res["result"] || []
+  if results.empty? && options[:table].nil? && table != "task"
+    res = sn_request(cfg, "GET", "/api/now/table/task", params: params)
+    results = res["result"] || []
+  end
+
+  if results.empty?
+    $stderr.puts "#{Colors::RED}Ticket '#{ident}' not found.#{Colors::RESET}"
+    exit 1
+  end
+
+  record = results[0]
+  if options[:json]
+    puts JSON.pretty_generate(record)
+    return
+  end
+
+  num = extract_display(record["number"])
+  num = ident if num.empty?
+  short_desc = extract_display(record["short_description"])
+  state = extract_display(record["state"])
+  priority = extract_display(record["priority"])
+  assigned_to = extract_display(record["assigned_to"])
+  assigned_to = "Unassigned" if assigned_to.empty?
+  group = extract_display(record["assignment_group"])
+  group = "None" if group.empty?
+  ci = extract_display(record["cmdb_ci"])
+  caller = [
+    extract_display(record["caller_id"]),
+    extract_display(record["requested_for"]),
+    extract_display(record["opened_by"])
+  ].find { |v| !v.empty? }.to_s
+  opened_at = extract_display(record["opened_at"])
+  updated_on = extract_display(record["sys_updated_on"])
+  desc = extract_display(record["description"])
+  close_notes = extract_display(record["close_notes"])
+  sys_id = extract_raw_value(record["sys_id"])
+
+  puts "#{Colors::BOLD}#{Colors::CYAN}#{num}#{Colors::RESET} — #{Colors::BOLD}#{short_desc}#{Colors::RESET}"
+  puts "#{Colors::DIM}#{'-' * 72}#{Colors::RESET}"
+  puts "#{Colors::BOLD}Table:#{Colors::RESET}            #{table} (sys_id: #{sys_id})"
+  puts "#{Colors::BOLD}State:#{Colors::RESET}            #{state}"
+  puts "#{Colors::BOLD}Priority:#{Colors::RESET}         #{priority}"
+  puts "#{Colors::BOLD}Caller/Opened By:#{Colors::RESET} #{caller}"
+  puts "#{Colors::BOLD}Assignment Group:#{Colors::RESET} #{group}"
+  puts "#{Colors::BOLD}Assigned To:#{Colors::RESET}      #{assigned_to}"
+  puts "#{Colors::BOLD}CMDB CI:#{Colors::RESET}          #{ci}" unless ci.empty?
+  puts "#{Colors::BOLD}Opened:#{Colors::RESET}           #{opened_at}"
+  puts "#{Colors::BOLD}Last Updated:#{Colors::RESET}     #{updated_on}"
+  puts "#{Colors::BOLD}URL:#{Colors::RESET}              #{cfg['instance']}/nav_to.do?uri=#{table}.do?sys_id=#{sys_id}"
+
+  unless desc.empty?
+    puts "\n#{Colors::BOLD}Description:#{Colors::RESET}"
+    puts indent_text(desc.strip, "  ")
+  end
+
+  unless close_notes.empty?
+    puts "\n#{Colors::BOLD}Close Notes:#{Colors::RESET}"
+    puts indent_text(close_notes.strip, "  ")
+  end
+
+  if options[:comments] && !sys_id.empty?
+    j_params = {
+      "sysparm_query"         => "element_id=#{sys_id}^ORDERBYDESCsys_created_on",
+      "sysparm_fields"        => "element,sys_created_on,sys_created_by,value",
+      "sysparm_display_value" => "true",
+      "sysparm_limit"         => "20"
     }
+    j_res = sn_request(cfg, "GET", "/api/now/table/sys_journal_field", params: j_params)
+    entries = j_res["result"] || []
+    puts "\n#{Colors::BOLD}Comments & Work Notes (#{entries.length}):#{Colors::RESET}"
+    entries.each do |entry|
+      el = extract_display(entry["element"])
+      when_ts = extract_display(entry["sys_created_on"])
+      who = extract_display(entry["sys_created_by"])
+      val = extract_display(entry["value"]).strip
+      tag = el == "work_notes" ? "WORK NOTE" : "COMMENT"
+      puts "  #{Colors::YELLOW}[#{when_ts}] #{who} (#{tag}):#{Colors::RESET}"
+      puts indent_text(val, "    ")
+      puts
+    end
+  end
+end
 
-    if auth_type == "token":
-        token = getpass.getpass("Bearer / OAuth Token: ").strip() or existing.get("token", "")
-        default_user = existing.get("username", "")
-        username = input(f"Your ServiceNow username (optional, for --mine) [{default_user}]: ").strip() or default_user
-        profile_data["token"] = token
-        profile_data["username"] = username
-    elif auth_type == "cookie":
-        cookie = getpass.getpass("Browser Cookie header string: ").strip() or existing.get("cookie", "")
-        user_token = input("X-UserToken (if required, optional): ").strip() or existing.get("user_token", "")
-        default_user = existing.get("username", "")
-        username = input(f"Your ServiceNow username (optional, for --mine) [{default_user}]: ").strip() or default_user
-        profile_data["cookie"] = cookie
-        profile_data["user_token"] = user_token
-        profile_data["username"] = username
-    else:
-        default_user = existing.get("username", "")
-        username = input(f"Username [{default_user}]: ").strip() or default_user
-        password = getpass.getpass("Password (leave blank to keep existing): ") or existing.get("password", "")
-        profile_data["username"] = username
-        profile_data["password"] = password
+def cmd_create(options)
+  cfg = load_config(options[:profile])
+  table = options[:table] || "incident"
 
-    save_config(profile, profile_data)
-    print(f"{Colors.GREEN}Saved configuration to {CONFIG_PATH} (permissions 0600).{Colors.RESET}")
+  payload = parse_kv_and_json(options[:set], options[:data])
 
+  title = options[:title] || options[:short_description]
+  payload["short_description"] = title if title && !title.empty?
+  payload["description"] = options[:desc] if options[:desc]
+  payload["urgency"] = options[:urgency].to_s if options[:urgency]
+  payload["impact"] = options[:impact].to_s if options[:impact]
+  payload["priority"] = options[:priority].to_s if options[:priority]
+  payload["assignment_group"] = options[:group] if options[:group]
+  payload["assigned_to"] = options[:assigned_to] if options[:assigned_to]
+  if options[:caller]
+    payload["caller_id"] = options[:caller]
+  elsif cfg["username"] && !cfg["username"].empty? && !payload.key?("caller_id") && table == "incident"
+    payload["caller_id"] = cfg["username"]
+  end
+  payload["cmdb_ci"] = options[:ci] if options[:ci]
+  payload["category"] = options[:category] if options[:category]
+  payload["subcategory"] = options[:subcategory] if options[:subcategory]
 
-def cmd_list(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    table = args.table
+  if (payload["short_description"].nil? || payload["short_description"].to_s.empty?) &&
+     options[:data].nil? && Array(options[:set]).empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Provide a short description (e.g. 'sn create \"Server down\"') or --data/--set."
+    exit 1
+  end
 
-    query_parts: List[str] = []
-    if not args.all and not args.query:
-        query_parts.append("active=true")
+  params = { "sysparm_display_value" => "all", "sysparm_input_display_value" => "true" }
+  res = sn_request(cfg, "POST", "/api/now/table/#{table}", params: params, body: payload)
+  record = res["result"] || {}
 
-    if args.mine:
-        user = cfg.get("username")
-        if not user:
-            sys.stderr.write("Error: username not set in profile for --mine.\n")
-            sys.exit(1)
-        query_parts.append(f"assigned_to.user_name={user}")
+  if options[:json]
+    puts JSON.pretty_generate(record)
+    return
+  end
 
-    if args.caller:
-        query_parts.append(f"caller_id.user_name={args.caller}^ORopened_by.user_name={args.caller}")
+  num = extract_display(record["number"])
+  sys_id = extract_raw_value(record["sys_id"])
+  state = extract_display(record["state"])
+  priority = extract_display(record["priority"])
+  label = num.empty? ? sys_id : num
+  puts "#{Colors::GREEN}Created #{table} record:#{Colors::RESET} #{Colors::BOLD}#{label}#{Colors::RESET}"
+  puts "  State: #{state} | Priority: #{priority}" if !state.empty? || !priority.empty?
+  puts "  URL:   #{cfg['instance']}/nav_to.do?uri=#{table}.do?sys_id=#{sys_id}"
+end
 
-    if args.group:
-        query_parts.append(f"assignment_group.nameLIKE{args.group}")
+def cmd_update(options)
+  cfg = load_config(options[:profile])
+  ident = options[:ticket].strip
+  table = detect_table(ident, options[:table])
+  sys_id = resolve_ticket_sys_id(cfg, ident, table)
 
-    if args.state:
-        query_parts.append(f"state={args.state}")
+  payload = parse_kv_and_json(options[:set], options[:data])
 
-    if args.priority:
-        query_parts.append(f"priority={args.priority}")
+  payload["state"] = options[:state] if options[:state]
+  payload["short_description"] = options[:title] if options[:title]
+  payload["description"] = options[:desc] if options[:desc]
+  payload["urgency"] = options[:urgency].to_s if options[:urgency]
+  payload["impact"] = options[:impact].to_s if options[:impact]
+  payload["priority"] = options[:priority].to_s if options[:priority]
+  payload["assignment_group"] = options[:group] if options[:group]
+  payload["assigned_to"] = options[:assigned_to] if options[:assigned_to]
+  payload["cmdb_ci"] = options[:ci] if options[:ci]
+  payload["comments"] = options[:comment] if options[:comment]
+  payload["work_notes"] = options[:work_note] if options[:work_note]
+  payload["close_code"] = options[:close_code] if options[:close_code]
+  payload["close_notes"] = options[:close_notes] if options[:close_notes]
 
-    if args.search:
-        query_parts.append(f"short_descriptionLIKE{args.search}^ORdescriptionLIKE{args.search}")
+  if payload.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} No fields specified to update."
+    exit 1
+  end
 
-    if args.query:
-        query_parts.append(args.query)
+  params = { "sysparm_display_value" => "all", "sysparm_input_display_value" => "true" }
+  res = sn_request(cfg, "PATCH", "/api/now/table/#{table}/#{sys_id}", params: params, body: payload)
+  record = res["result"] || {}
 
-    order_clause = f"ORDERBYDESC{args.sort}" if args.sort else "ORDERBYDESCsys_updated_on"
-    query_parts.append(order_clause)
+  if options[:json]
+    puts JSON.pretty_generate(record)
+    return
+  end
 
-    final_query = "^".join(query_parts)
-    fields = [f.strip() for f in args.fields.split(",") if f.strip()] if args.fields else DEFAULT_TICKET_FIELDS
+  num = extract_display(record["number"])
+  num = ident.upcase if num.empty?
+  state = extract_display(record["state"])
+  assigned = extract_display(record["assigned_to"])
+  assigned = "Unassigned" if assigned.empty?
+  puts "#{Colors::GREEN}Updated #{num}:#{Colors::RESET} State=#{state}, Assigned To=#{assigned}"
+end
 
-    params = {
-        "sysparm_query": final_query,
-        "sysparm_fields": ",".join(fields),
-        "sysparm_display_value": "true",
-        "sysparm_limit": str(args.limit),
-    }
+def cmd_comment(options)
+  cfg = load_config(options[:profile])
+  ident = options[:ticket].strip
+  table = detect_table(ident, options[:table])
+  sys_id = resolve_ticket_sys_id(cfg, ident, table)
 
-    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
-    records = res.get("result", [])
+  field_name = options[:work_note] ? "work_notes" : "comments"
+  payload = { field_name => options[:message] }
 
-    if args.output == "json":
-        print(json.dumps(records, indent=2))
-    elif args.output in ("csv", "tsv"):
-        delimiter = "\t" if args.output == "tsv" else ","
-        writer = csv.writer(sys.stdout, delimiter=delimiter)
-        writer.writerow(fields)
-        for r in records:
-            writer.writerow([extract_display(r.get(f, "")) for f in fields])
-    else:
-        print_table(records, fields, empty_msg="No matching tickets found.")
-
-
-def cmd_get(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ident = args.ticket.strip()
-    table = detect_table(ident, args.table)
-
-    query = f"sys_id={ident}" if is_sys_id(ident) else f"number={ident.upper()}"
-
-    params = {
-        "sysparm_query": query,
-        "sysparm_display_value": "all",
-        "sysparm_limit": "1",
-    }
-
-    res = sn_request(cfg, "GET", f"/api/now/table/{table}", params=params)
-    results = res.get("result", [])
-    if not results and not args.table and table != "task":
-        res = sn_request(cfg, "GET", "/api/now/table/task", params=params)
-        results = res.get("result", [])
-
-    if not results:
-        sys.stderr.write(f"{Colors.RED}Ticket '{ident}' not found.{Colors.RESET}\n")
-        sys.exit(1)
-
-    record = results[0]
-    if args.json:
-        print(json.dumps(record, indent=2))
-        return
-
-    num = extract_display(record.get("number")) or ident
-    short_desc = extract_display(record.get("short_description"))
-    state = extract_display(record.get("state"))
-    priority = extract_display(record.get("priority"))
-    assigned_to = extract_display(record.get("assigned_to")) or "Unassigned"
-    group = extract_display(record.get("assignment_group")) or "None"
-    ci = extract_display(record.get("cmdb_ci"))
-    caller = (
-        extract_display(record.get("caller_id"))
-        or extract_display(record.get("requested_for"))
-        or extract_display(record.get("opened_by"))
-    )
-    opened_at = extract_display(record.get("opened_at"))
-    updated_on = extract_display(record.get("sys_updated_on"))
-    desc = extract_display(record.get("description"))
-    close_notes = extract_display(record.get("close_notes"))
-    sys_id = extract_raw_value(record.get("sys_id"))
-
-    print(f"{Colors.BOLD}{Colors.CYAN}{num}{Colors.RESET} — {Colors.BOLD}{short_desc}{Colors.RESET}")
-    print(f"{Colors.DIM}{'-' * 72}{Colors.RESET}")
-    print(f"{Colors.BOLD}Table:{Colors.RESET}            {table} (sys_id: {sys_id})")
-    print(f"{Colors.BOLD}State:{Colors.RESET}            {state}")
-    print(f"{Colors.BOLD}Priority:{Colors.RESET}         {priority}")
-    print(f"{Colors.BOLD}Caller/Opened By:{Colors.RESET} {caller}")
-    print(f"{Colors.BOLD}Assignment Group:{Colors.RESET} {group}")
-    print(f"{Colors.BOLD}Assigned To:{Colors.RESET}      {assigned_to}")
-    if ci:
-        print(f"{Colors.BOLD}CMDB CI:{Colors.RESET}          {ci}")
-    print(f"{Colors.BOLD}Opened:{Colors.RESET}           {opened_at}")
-    print(f"{Colors.BOLD}Last Updated:{Colors.RESET}     {updated_on}")
-    print(f"{Colors.BOLD}URL:{Colors.RESET}              {cfg['instance']}/nav_to.do?uri={table}.do?sys_id={sys_id}")
-
-    if desc:
-        print(f"\n{Colors.BOLD}Description:{Colors.RESET}")
-        print(textwrap.indent(desc.strip(), "  "))
-
-    if close_notes:
-        print(f"\n{Colors.BOLD}Close Notes:{Colors.RESET}")
-        print(textwrap.indent(close_notes.strip(), "  "))
-
-    if args.comments and sys_id:
-        j_params = {
-            "sysparm_query": f"element_id={sys_id}^ORDERBYDESCsys_created_on",
-            "sysparm_fields": "element,sys_created_on,sys_created_by,value",
-            "sysparm_display_value": "true",
-            "sysparm_limit": "20",
-        }
-        j_res = sn_request(cfg, "GET", "/api/now/table/sys_journal_field", params=j_params)
-        entries = j_res.get("result", [])
-        print(f"\n{Colors.BOLD}Comments & Work Notes ({len(entries)}):{Colors.RESET}")
-        for entry in entries:
-            el = extract_display(entry.get("element"))
-            when = extract_display(entry.get("sys_created_on"))
-            who = extract_display(entry.get("sys_created_by"))
-            val = extract_display(entry.get("value")).strip()
-            tag = "WORK NOTE" if el == "work_notes" else "COMMENT"
-            print(f"  {Colors.YELLOW}[{when}] {who} ({tag}):{Colors.RESET}")
-            print(textwrap.indent(val, "    "))
-            print()
-
-
-def cmd_create(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    table = args.table
-
-    payload = parse_kv_And_json(args.set, args.data)
-
-    title = args.title or args.short_description
-    if title:
-        payload["short_description"] = title
-    if args.desc:
-        payload["description"] = args.desc
-    if args.urgency:
-        payload["urgency"] = str(args.urgency)
-    if args.impact:
-        payload["impact"] = str(args.impact)
-    if args.priority:
-        payload["priority"] = str(args.priority)
-    if args.group:
-        payload["assignment_group"] = args.group
-    if args.assigned_to:
-        payload["assigned_to"] = args.assigned_to
-    if args.caller:
-        payload["caller_id"] = args.caller
-    elif cfg.get("username") and "caller_id" not in payload and table == "incident":
-        payload["caller_id"] = cfg["username"]
-    if args.ci:
-        payload["cmdb_ci"] = args.ci
-    if args.category:
-        payload["category"] = args.category
-    if args.subcategory:
-        payload["subcategory"] = args.subcategory
-
-    if not payload.get("short_description") and not args.data and not args.set:
-        sys.stderr.write(
-            f"{Colors.RED}Error:{Colors.RESET} Provide a short description (e.g. 'sn create \"Server down\"') or --data/--set.\n"
-        )
-        sys.exit(1)
-
-    params = {"sysparm_display_value": "all", "sysparm_input_display_value": "true"}
-    res = sn_request(cfg, "POST", f"/api/now/table/{table}", params=params, body=payload)
-    record = res.get("result", {})
-
-    if args.json:
-        print(json.dumps(record, indent=2))
-        return
-
-    num = extract_display(record.get("number"))
-    sys_id = extract_raw_value(record.get("sys_id"))
-    state = extract_display(record.get("state"))
-    priority = extract_display(record.get("priority"))
-    print(f"{Colors.GREEN}Created {table} record:{Colors.RESET} {Colors.BOLD}{num or sys_id}{Colors.RESET}")
-    if state or priority:
-        print(f"  State: {state} | Priority: {priority}")
-    print(f"  URL:   {cfg['instance']}/nav_to.do?uri={table}.do?sys_id={sys_id}")
-
-
-def cmd_update(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ident = args.ticket.strip()
-    table = detect_table(ident, args.table)
-    sys_id = resolve_ticket_sys_id(cfg, ident, table)
-
-    payload = parse_kv_And_json(args.set, args.data)
-
-    if args.state:
-        payload["state"] = args.state
-    if args.title:
-        payload["short_description"] = args.title
-    if args.desc:
-        payload["description"] = args.desc
-    if args.urgency:
-        payload["urgency"] = str(args.urgency)
-    if args.impact:
-        payload["impact"] = str(args.impact)
-    if args.priority:
-        payload["priority"] = str(args.priority)
-    if args.group:
-        payload["assignment_group"] = args.group
-    if args.assigned_to:
-        payload["assigned_to"] = args.assigned_to
-    if args.ci:
-        payload["cmdb_ci"] = args.ci
-    if args.comment:
-        payload["comments"] = args.comment
-    if args.work_note:
-        payload["work_notes"] = args.work_note
-    if args.close_code:
-        payload["close_code"] = args.close_code
-    if args.close_notes:
-        payload["close_notes"] = args.close_notes
-
-    if not payload:
-        sys.stderr.write(f"{Colors.RED}Error:{Colors.RESET} No fields specified to update.\n")
-        sys.exit(1)
-
-    params = {"sysparm_display_value": "all", "sysparm_input_display_value": "true"}
-    res = sn_request(cfg, "PATCH", f"/api/now/table/{table}/{sys_id}", params=params, body=payload)
-    record = res.get("result", {})
-
-    if args.json:
-        print(json.dumps(record, indent=2))
-        return
-
-    num = extract_display(record.get("number")) or ident.upper()
-    state = extract_display(record.get("state"))
-    assigned = extract_display(record.get("assigned_to")) or "Unassigned"
-    print(f"{Colors.GREEN}Updated {num}:{Colors.RESET} State={state}, Assigned To={assigned}")
-
-
-def cmd_comment(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ident = args.ticket.strip()
-    table = detect_table(ident, args.table)
-    sys_id = resolve_ticket_sys_id(cfg, ident, table)
-
-    field_name = "work_notes" if args.work_note else "comments"
-    payload = {field_name: args.message}
-
-    sn_request(cfg, "PATCH", f"/api/now/table/{table}/{sys_id}", body=payload)
-    print(f"{Colors.GREEN}Added {field_name} to {ident.upper()}.{Colors.RESET}")
-
+  sn_request(cfg, "PATCH", "/api/now/table/#{table}/#{sys_id}", body: payload)
+  puts "#{Colors::GREEN}Added #{field_name} to #{ident.upcase}.#{Colors::RESET}"
+end
 
 # ---------------------------------------------------------------------------
 # Commands: CMDB (Configuration Items)
 # ---------------------------------------------------------------------------
 
+def resolve_ci_record(cfg, ident, ci_class)
+  query = if sys_id?(ident)
+            "sys_id=#{ident}"
+          else
+            "name=#{ident}^ORserial_number=#{ident}^ORip_address=#{ident}^ORasset_tag=#{ident}"
+          end
 
-def resolve_ci_record(cfg: Dict[str, Any], ident: str, ci_class: str) -> Dict[str, Any]:
-    if is_sys_id(ident):
-        query = f"sys_id={ident}"
-    else:
-        query = f"name={ident}^ORserial_number={ident}^ORip_address={ident}^ORasset_tag={ident}"
+  params = {
+    "sysparm_query"         => query,
+    "sysparm_display_value" => "all",
+    "sysparm_limit"         => "1"
+  }
+  res = sn_request(cfg, "GET", "/api/now/table/#{ci_class}", params: params)
+  results = res["result"] || []
+  if results.empty? && ci_class != "cmdb_ci"
+    res = sn_request(cfg, "GET", "/api/now/table/cmdb_ci", params: params)
+    results = res["result"] || []
+  end
+  if results.empty?
+    $stderr.puts "#{Colors::RED}CMDB CI '#{ident}' not found.#{Colors::RESET}"
+    exit 1
+  end
+  results[0]
+end
 
-    params = {
-        "sysparm_query": query,
-        "sysparm_display_value": "all",
-        "sysparm_limit": "1",
+def cmd_cmdb_list(options)
+  cfg = load_config(options[:profile])
+  ci_class = resolve_cmdb_class(options[:ci_class], default: "cmdb_ci")
+
+  query_parts = []
+  if options[:search]
+    s = options[:search]
+    query_parts << "nameLIKE#{s}^ORip_addressLIKE#{s}^ORserial_numberLIKE#{s}^ORasset_tagLIKE#{s}"
+  end
+  query_parts << "ip_addressLIKE#{options[:ip]}" if options[:ip]
+  query_parts << "serial_number=#{options[:serial]}" if options[:serial]
+  query_parts << "osLIKE#{options[:os]}" if options[:os]
+  query_parts << "operational_status=#{options[:status]}" if options[:status]
+  query_parts << options[:query] if options[:query] && !options[:query].empty?
+
+  query_parts << "ORDERBYDESCsys_updated_on"
+  final_query = query_parts.join("^")
+
+  fields = if options[:fields] && !options[:fields].empty?
+             options[:fields].split(",").map(&:strip).reject(&:empty?)
+           else
+             DEFAULT_CMDB_FIELDS
+           end
+
+  params = {
+    "sysparm_query"         => final_query,
+    "sysparm_fields"        => fields.join(","),
+    "sysparm_display_value" => "true",
+    "sysparm_limit"         => (options[:limit] || 25).to_s
+  }
+
+  res = sn_request(cfg, "GET", "/api/now/table/#{ci_class}", params: params)
+  records = res["result"] || []
+
+  case options[:output]
+  when "json"
+    puts JSON.pretty_generate(records)
+  when "csv", "tsv"
+    delimiter = options[:output] == "tsv" ? "\t" : ","
+    $stdout.write(format_delimited_row(fields, delimiter))
+    records.each do |r|
+      $stdout.write(format_delimited_row(fields.map { |f| extract_display(r[f]) }, delimiter))
+    end
+  else
+    print_table(records, fields, empty_msg: "No matching CMDB items found.")
+  end
+end
+
+def cmd_cmdb_get(options)
+  cfg = load_config(options[:profile])
+  ci_class = resolve_cmdb_class(options[:ci_class], default: "cmdb_ci")
+  record = resolve_ci_record(cfg, options[:identifier].strip, ci_class)
+
+  if options[:json]
+    puts JSON.pretty_generate(record)
+    return
+  end
+
+  name = extract_display(record["name"])
+  name = options[:identifier] if name.empty?
+  actual_class = extract_raw_value(record["sys_class_name"])
+  actual_class = ci_class if actual_class.empty?
+  class_label = extract_display(record["sys_class_name"])
+  class_label = actual_class if class_label.empty?
+  sys_id = extract_raw_value(record["sys_id"])
+  ip = extract_display(record["ip_address"])
+  serial = extract_display(record["serial_number"])
+  asset_tag = extract_display(record["asset_tag"])
+  op_status = extract_display(record["operational_status"])
+  inst_status = extract_display(record["install_status"])
+  assigned_to = extract_display(record["assigned_to"])
+  support_group = extract_display(record["support_group"])
+  location = extract_display(record["location"])
+  os_val = extract_display(record["os"])
+  ram = extract_display(record["ram"])
+  cpu = extract_display(record["cpu_count"])
+  updated = extract_display(record["sys_updated_on"])
+  short_desc = extract_display(record["short_description"])
+
+  puts "#{Colors::BOLD}#{Colors::CYAN}#{name}#{Colors::RESET} — #{Colors::BOLD}#{class_label}#{Colors::RESET}"
+  puts "#{Colors::DIM}#{'-' * 72}#{Colors::RESET}"
+  puts "#{Colors::BOLD}Class Table:#{Colors::RESET}        #{actual_class} (sys_id: #{sys_id})"
+  puts "#{Colors::BOLD}Operational Status:#{Colors::RESET} #{op_status}"
+  puts "#{Colors::BOLD}Install Status:#{Colors::RESET}     #{inst_status}"
+  puts "#{Colors::BOLD}IP Address:#{Colors::RESET}         #{ip}" unless ip.empty?
+  puts "#{Colors::BOLD}Serial Number:#{Colors::RESET}      #{serial}" unless serial.empty?
+  puts "#{Colors::BOLD}Asset Tag:#{Colors::RESET}          #{asset_tag}" unless asset_tag.empty?
+  puts "#{Colors::BOLD}Operating System:#{Colors::RESET}   #{os_val}" unless os_val.empty?
+  if !ram.empty? || !cpu.empty?
+    cpu_str = cpu.empty? ? "N/A" : cpu
+    ram_str = ram.empty? ? "N/A" : ram
+    puts "#{Colors::BOLD}Hardware:#{Colors::RESET}           CPU: #{cpu_str} | RAM: #{ram_str} MB"
+  end
+  puts "#{Colors::BOLD}Assigned To:#{Colors::RESET}        #{assigned_to}" unless assigned_to.empty?
+  puts "#{Colors::BOLD}Support Group:#{Colors::RESET}      #{support_group}" unless support_group.empty?
+  puts "#{Colors::BOLD}Location:#{Colors::RESET}           #{location}" unless location.empty?
+  puts "#{Colors::BOLD}Last Updated:#{Colors::RESET}       #{updated}"
+  puts "#{Colors::BOLD}URL:#{Colors::RESET}                #{cfg['instance']}/nav_to.do?uri=#{actual_class}.do?sys_id=#{sys_id}"
+
+  puts "\n#{Colors::BOLD}Description:#{Colors::RESET}\n  #{short_desc}" unless short_desc.empty?
+
+  if options[:relationships] && !sys_id.empty?
+    r_params = {
+      "sysparm_query"         => "parent=#{sys_id}^ORchild=#{sys_id}",
+      "sysparm_fields"        => "parent,type,child",
+      "sysparm_display_value" => "true",
+      "sysparm_limit"         => "50"
     }
-    res = sn_request(cfg, "GET", f"/api/now/table/{ci_class}", params=params)
-    results = res.get("result", [])
-    if not results and ci_class != "cmdb_ci":
-        res = sn_request(cfg, "GET", "/api/now/table/cmdb_ci", params=params)
-        results = res.get("result", [])
-    if not results:
-        sys.stderr.write(f"{Colors.RED}CMDB CI '{ident}' not found.{Colors.RESET}\n")
-        sys.exit(1)
-    return results[0]
+    r_res = sn_request(cfg, "GET", "/api/now/table/cmdb_rel_ci", params: r_params)
+    rels = r_res["result"] || []
+    puts "\n#{Colors::BOLD}CI Relationships (#{rels.length}):#{Colors::RESET}"
+    rels.each do |rel|
+      p_ci = extract_display(rel["parent"])
+      t_ci = extract_display(rel["type"])
+      c_ci = extract_display(rel["child"])
+      puts "  #{p_ci}  #{Colors::YELLOW}[#{t_ci}]#{Colors::RESET}  -->  #{c_ci}"
+    end
+  end
+end
 
+def build_ci_attributes(options)
+  attrs = parse_kv_and_json(options[:set], options[:data])
+  attrs["name"] = options[:name] if options[:name] && !options[:name].empty?
+  attrs["ip_address"] = options[:ip] if options[:ip]
+  attrs["serial_number"] = options[:serial] if options[:serial]
+  attrs["asset_tag"] = options[:asset_tag] if options[:asset_tag]
+  attrs["os"] = options[:os] if options[:os]
+  attrs["ram"] = options[:ram].to_s if options[:ram]
+  attrs["cpu_count"] = options[:cpu_count].to_s if options[:cpu_count]
+  attrs["location"] = options[:location] if options[:location]
+  attrs["assigned_to"] = options[:assigned_to] if options[:assigned_to]
+  attrs["support_group"] = options[:group] if options[:group]
+  attrs["operational_status"] = options[:status].to_s if options[:status]
+  attrs["short_description"] = options[:desc] if options[:desc]
+  attrs
+end
 
-def cmd_cmdb_list(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ci_class = resolve_cmdb_class(args.ci_class, default="cmdb_ci")
+def cmd_cmdb_create(options)
+  cfg = load_config(options[:profile])
+  ci_class = resolve_cmdb_class(options[:ci_class], default: "cmdb_ci_server")
+  attrs = build_ci_attributes(options)
 
-    query_parts: List[str] = []
-    if args.search:
-        s = args.search
-        query_parts.append(f"nameLIKE{s}^ORip_addressLIKE{s}^ORserial_numberLIKE{s}^ORasset_tagLIKE{s}")
-    if args.ip:
-        query_parts.append(f"ip_addressLIKE{args.ip}")
-    if args.serial:
-        query_parts.append(f"serial_number={args.serial}")
-    if args.os:
-        query_parts.append(f"osLIKE{args.os}")
-    if args.status:
-        query_parts.append(f"operational_status={args.status}")
-    if args.query:
-        query_parts.append(args.query)
+  if attrs["name"].nil? || attrs["name"].to_s.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} CI name is required."
+    exit 1
+  end
 
-    query_parts.append("ORDERBYDESCsys_updated_on")
-    final_query = "^".join(query_parts)
-
-    fields = [f.strip() for f in args.fields.split(",") if f.strip()] if args.fields else DEFAULT_CMDB_FIELDS
-
-    params = {
-        "sysparm_query": final_query,
-        "sysparm_fields": ",".join(fields),
-        "sysparm_display_value": "true",
-        "sysparm_limit": str(args.limit),
+  if options[:ire]
+    body = {
+      "discovery_source" => options[:source] || "Manual Entry",
+      "attributes"       => attrs
     }
+    res = sn_request(cfg, "POST", "/api/now/cmdb/instance/#{ci_class}", body: body)
+    result_obj = res["result"].is_a?(Hash) ? res["result"] : {}
+    record = result_obj["attributes"].is_a?(Hash) ? result_obj["attributes"] : result_obj
+  else
+    params = { "sysparm_display_value" => "all", "sysparm_input_display_value" => "true" }
+    res = sn_request(cfg, "POST", "/api/now/table/#{ci_class}", params: params, body: attrs)
+    record = res["result"] || {}
+  end
 
-    res = sn_request(cfg, "GET", f"/api/now/table/{ci_class}", params=params)
-    records = res.get("result", [])
+  if options[:json]
+    puts JSON.pretty_generate(res["result"] || {})
+    return
+  end
 
-    if args.output == "json":
-        print(json.dumps(records, indent=2))
-    elif args.output in ("csv", "tsv"):
-        delimiter = "\t" if args.output == "tsv" else ","
-        writer = csv.writer(sys.stdout, delimiter=delimiter)
-        writer.writerow(fields)
-        for r in records:
-            writer.writerow([extract_display(r.get(f, "")) for f in fields])
-    else:
-        print_table(records, fields, empty_msg="No matching CMDB items found.")
+  name = extract_display(record["name"])
+  name = attrs["name"] if name.empty?
+  sys_id = extract_raw_value(record["sys_id"])
+  puts "#{Colors::GREEN}Created/Reconciled CMDB CI (#{ci_class}):#{Colors::RESET} #{Colors::BOLD}#{name}#{Colors::RESET} (sys_id: #{sys_id})"
+  puts "  URL: #{cfg['instance']}/nav_to.do?uri=#{ci_class}.do?sys_id=#{sys_id}" unless sys_id.empty?
+end
 
+def cmd_cmdb_update(options)
+  cfg = load_config(options[:profile])
+  ci_class = resolve_cmdb_class(options[:ci_class], default: "cmdb_ci")
+  existing = resolve_ci_record(cfg, options[:identifier].strip, ci_class)
+  sys_id = extract_raw_value(existing["sys_id"])
+  actual_class = extract_raw_value(existing["sys_class_name"])
+  actual_class = ci_class if actual_class.empty?
 
-def cmd_cmdb_get(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ci_class = resolve_cmdb_class(args.ci_class, default="cmdb_ci")
-    record = resolve_ci_record(cfg, args.identifier.strip(), ci_class)
+  attrs = build_ci_attributes(options)
+  attrs["name"] = options[:new_name] if options[:new_name]
 
-    if args.json:
-        print(json.dumps(record, indent=2))
-        return
+  if attrs.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} No attributes specified to update."
+    exit 1
+  end
 
-    name = extract_display(record.get("name")) or args.identifier
-    actual_class = extract_raw_value(record.get("sys_class_name")) or ci_class
-    class_label = extract_display(record.get("sys_class_name")) or actual_class
-    sys_id = extract_raw_value(record.get("sys_id"))
-    ip = extract_display(record.get("ip_address"))
-    serial = extract_display(record.get("serial_number"))
-    asset_tag = extract_display(record.get("asset_tag"))
-    op_status = extract_display(record.get("operational_status"))
-    inst_status = extract_display(record.get("install_status"))
-    assigned_to = extract_display(record.get("assigned_to"))
-    support_group = extract_display(record.get("support_group"))
-    location = extract_display(record.get("location"))
-    os_val = extract_display(record.get("os"))
-    ram = extract_display(record.get("ram"))
-    cpu = extract_display(record.get("cpu_count"))
-    updated = extract_display(record.get("sys_updated_on"))
-    short_desc = extract_display(record.get("short_description"))
+  params = { "sysparm_display_value" => "all", "sysparm_input_display_value" => "true" }
+  res = sn_request(cfg, "PATCH", "/api/now/table/#{actual_class}/#{sys_id}", params: params, body: attrs)
+  record = res["result"] || {}
 
-    print(f"{Colors.BOLD}{Colors.CYAN}{name}{Colors.RESET} — {Colors.BOLD}{class_label}{Colors.RESET}")
-    print(f"{Colors.DIM}{'-' * 72}{Colors.RESET}")
-    print(f"{Colors.BOLD}Class Table:{Colors.RESET}        {actual_class} (sys_id: {sys_id})")
-    print(f"{Colors.BOLD}Operational Status:{Colors.RESET} {op_status}")
-    print(f"{Colors.BOLD}Install Status:{Colors.RESET}     {inst_status}")
-    if ip:
-        print(f"{Colors.BOLD}IP Address:{Colors.RESET}         {ip}")
-    if serial:
-        print(f"{Colors.BOLD}Serial Number:{Colors.RESET}      {serial}")
-    if asset_tag:
-        print(f"{Colors.BOLD}Asset Tag:{Colors.RESET}          {asset_tag}")
-    if os_val:
-        print(f"{Colors.BOLD}Operating System:{Colors.RESET}   {os_val}")
-    if ram or cpu:
-        print(f"{Colors.BOLD}Hardware:{Colors.RESET}           CPU: {cpu or 'N/A'} | RAM: {ram or 'N/A'} MB")
-    if assigned_to:
-        print(f"{Colors.BOLD}Assigned To:{Colors.RESET}        {assigned_to}")
-    if support_group:
-        print(f"{Colors.BOLD}Support Group:{Colors.RESET}      {support_group}")
-    if location:
-        print(f"{Colors.BOLD}Location:{Colors.RESET}           {location}")
-    print(f"{Colors.BOLD}Last Updated:{Colors.RESET}       {updated}")
-    print(f"{Colors.BOLD}URL:{Colors.RESET}                {cfg['instance']}/nav_to.do?uri={actual_class}.do?sys_id={sys_id}")
+  if options[:json]
+    puts JSON.pretty_generate(record)
+    return
+  end
 
-    if short_desc:
-        print(f"\n{Colors.BOLD}Description:{Colors.RESET}\n  {short_desc}")
-
-    if args.relationships and sys_id:
-        r_params = {
-            "sysparm_query": f"parent={sys_id}^ORchild={sys_id}",
-            "sysparm_fields": "parent,type,child",
-            "sysparm_display_value": "true",
-            "sysparm_limit": "50",
-        }
-        r_res = sn_request(cfg, "GET", "/api/now/table/cmdb_rel_ci", params=r_params)
-        rels = r_res.get("result", [])
-        print(f"\n{Colors.BOLD}CI Relationships ({len(rels)}):{Colors.RESET}")
-        for rel in rels:
-            p = extract_display(rel.get("parent"))
-            t = extract_display(rel.get("type"))
-            c = extract_display(rel.get("child"))
-            print(f"  {p}  {Colors.YELLOW}[{t}]{Colors.RESET}  -->  {c}")
-
-
-def build_ci_attributes(args: argparse.Namespace) -> Dict[str, Any]:
-    attrs = parse_kv_And_json(args.set, args.data)
-    if getattr(args, "name", None):
-        attrs["name"] = args.name
-    if args.ip:
-        attrs["ip_address"] = args.ip
-    if args.serial:
-        attrs["serial_number"] = args.serial
-    if args.asset_tag:
-        attrs["asset_tag"] = args.asset_tag
-    if args.os:
-        attrs["os"] = args.os
-    if args.ram:
-        attrs["ram"] = str(args.ram)
-    if args.cpu_count:
-        attrs["cpu_count"] = str(args.cpu_count)
-    if args.location:
-        attrs["location"] = args.location
-    if args.assigned_to:
-        attrs["assigned_to"] = args.assigned_to
-    if args.group:
-        attrs["support_group"] = args.group
-    if args.status:
-        attrs["operational_status"] = str(args.status)
-    if args.desc:
-        attrs["short_description"] = args.desc
-    return attrs
-
-
-def cmd_cmdb_create(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ci_class = resolve_cmdb_class(args.ci_class, default="cmdb_ci_server")
-    attrs = build_ci_attributes(args)
-
-    if not attrs.get("name"):
-        sys.stderr.write(f"{Colors.RED}Error:{Colors.RESET} CI name is required.\n")
-        sys.exit(1)
-
-    if args.ire:
-        # Use CMDB Instance API (Identification & Reconciliation Engine)
-        body = {
-            "discovery_source": args.source or "Manual Entry",
-            "attributes": attrs,
-        }
-        res = sn_request(cfg, "POST", f"/api/now/cmdb/instance/{ci_class}", body=body)
-        record = res.get("result", {}).get("attributes", res.get("result", {}))
-    else:
-        # Direct Table API
-        params = {"sysparm_display_value": "all", "sysparm_input_display_value": "true"}
-        res = sn_request(cfg, "POST", f"/api/now/table/{ci_class}", params=params, body=attrs)
-        record = res.get("result", {})
-
-    if args.json:
-        print(json.dumps(res.get("result", {}), indent=2))
-        return
-
-    name = extract_display(record.get("name")) or attrs.get("name")
-    sys_id = extract_raw_value(record.get("sys_id"))
-    print(f"{Colors.GREEN}Created/Reconciled CMDB CI ({ci_class}):{Colors.RESET} {Colors.BOLD}{name}{Colors.RESET} (sys_id: {sys_id})")
-    if sys_id:
-        print(f"  URL: {cfg['instance']}/nav_to.do?uri={ci_class}.do?sys_id={sys_id}")
-
-
-def cmd_cmdb_update(args: argparse.Namespace) -> None:
-    cfg = load_config(args.profile)
-    ci_class = resolve_cmdb_class(args.ci_class, default="cmdb_ci")
-    existing = resolve_ci_record(cfg, args.identifier.strip(), ci_class)
-    sys_id = extract_raw_value(existing.get("sys_id"))
-    actual_class = extract_raw_value(existing.get("sys_class_name")) or ci_class
-
-    attrs = build_ci_attributes(args)
-    if args.new_name:
-        attrs["name"] = args.new_name
-
-    if not attrs:
-        sys.stderr.write(f"{Colors.RED}Error:{Colors.RESET} No attributes specified to update.\n")
-        sys.exit(1)
-
-    params = {"sysparm_display_value": "all", "sysparm_input_display_value": "true"}
-    res = sn_request(cfg, "PATCH", f"/api/now/table/{actual_class}/{sys_id}", params=params, body=attrs)
-    record = res.get("result", {})
-
-    if args.json:
-        print(json.dumps(record, indent=2))
-        return
-
-    name = extract_display(record.get("name")) or args.identifier
-    print(f"{Colors.GREEN}Updated CMDB CI:{Colors.RESET} {Colors.BOLD}{name}{Colors.RESET} ({actual_class} / {sys_id})")
-
+  name = extract_display(record["name"])
+  name = options[:identifier] if name.empty?
+  puts "#{Colors::GREEN}Updated CMDB CI:#{Colors::RESET} #{Colors::BOLD}#{name}#{Colors::RESET} (#{actual_class} / #{sys_id})"
+end
 
 # ---------------------------------------------------------------------------
-# Argument Parser
+# Argument Parsing & CLI Dispatch
 # ---------------------------------------------------------------------------
 
+MAIN_HELP = <<~HELP
+  usage: sn [-h] [-p PROFILE] {config,get,list,query,ls,create,update,comment,cmdb} ...
 
-def add_common_ci_mutation_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--ip", help="IP address")
-    parser.add_argument("--serial", help="Serial number")
-    parser.add_argument("--asset-tag", help="Asset tag")
-    parser.add_argument("--os", help="Operating system")
-    parser.add_argument("--ram", help="RAM in MB")
-    parser.add_argument("--cpu-count", help="Number of CPUs")
-    parser.add_argument("--location", help="Location name or sys_id")
-    parser.add_argument("-a", "--assigned-to", help="Assigned user")
-    parser.add_argument("-g", "--group", help="Support group")
-    parser.add_argument("--status", help="Operational status (e.g. 1=Operational, 2=Non-Operational)")
-    parser.add_argument("-D", "--desc", help="Short description")
-    parser.add_argument("-S", "--set", action="append", metavar="KEY=VAL", help="Set arbitrary field (repeatable)")
-    parser.add_argument("-d", "--data", help="Raw JSON object string to merge into payload")
-    parser.add_argument("--json", action="store_true", help="Output raw JSON")
+  ServiceNow CLI for querying, creating, and updating tickets and CMDB items.
 
+  positional arguments:
+    {config,get,list,query,ls,create,update,comment,cmdb}
+      config              Configure ServiceNow instance URL and credentials
+      get                 Get details of a single ticket by Number or sys_id
+      list (query, ls)    Query and list tickets
+      create              Create a new Incident or ticket
+      update              Update an existing ticket
+      comment             Add a comment or work note to a ticket
+      cmdb                Query, inspect, create, and update CMDB Configuration Items (CIs)
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="sn",
-        description="ServiceNow CLI for querying, creating, and updating tickets and CMDB items.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent(
-            """\
-            Examples:
-              # Setup
-              sn config
+  options:
+    -h, --help            Show this help message and exit
+    -p, --profile PROFILE Config profile name (default: 'default')
 
-              # Query & Inspect Tickets
-              sn get INC0010001 --comments
-              sn list --mine
-              sn list -t incident --priority 1
+  Examples:
+    # Setup
+    sn config
 
-              # Create & Update Incidents / Tickets
-              sn create "VPN Down in Madrid" -D "Users cannot connect" --urgency 1 --impact 2 -g "Network"
-              sn update INC0010001 --state "In Progress" -a fnovella -w "Investigating firewall"
-              sn comment INC0010001 "Issue resolved" --work-note
+    # Query & Inspect Tickets
+    sn get INC0010001 --comments
+    sn list --mine
+    sn list -t incident --priority 1
 
-              # Query, Create & Update CMDB Configuration Items
-              sn cmdb list -c linux -s "mad"
-              sn cmdb get srv-linux-mad01 --relationships
-              sn cmdb create srv-linux-mad02 -c linux --ip 10.20.30.40 --serial SN12345 --os "Linux Red Hat"
-              sn cmdb update srv-linux-mad02 --ram 32768 -S environment=Production
-            """
-        ),
-    )
-    parser.add_argument("-p", "--profile", default="default", help="Config profile name (default: 'default')")
+    # Create & Update Incidents / Tickets
+    sn create "VPN Down in Madrid" -D "Users cannot connect" --urgency 1 --impact 2 -g "Network"
+    sn update INC0010001 --state "In Progress" -a fnovella -w "Investigating firewall"
+    sn comment INC0010001 "Issue resolved" --work-note
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Query, Create & Update CMDB Configuration Items
+    sn cmdb list -c linux -s "mad"
+    sn cmdb get srv-linux-mad01 --relationships
+    sn cmdb create srv-linux-mad02 -c linux --ip 10.20.30.40 --serial SN12345 --os "Linux Red Hat"
+    sn cmdb update srv-linux-mad02 --ram 32768 -S environment=Production
+HELP
 
-    # sn config
-    sub.add_parser("config", help="Configure ServiceNow instance URL and credentials")
+CMDB_HELP = <<~HELP
+  usage: sn cmdb [-h] {list,ls,query,get,create,update} ...
 
-    # sn get
-    p_get = sub.add_parser("get", help="Get details of a single ticket by Number or sys_id")
-    p_get.add_argument("ticket", help="Ticket number (e.g. INC0012345, RITM0012345, CHG0012345) or sys_id")
-    p_get.add_argument("-t", "--table", help="Override table name (auto-detected from prefix by default)")
-    p_get.add_argument("-c", "--comments", action="store_true", help="Include comments and work notes")
-    p_get.add_argument("--json", action="store_true", help="Output raw JSON")
+  Manage ServiceNow CMDB Configuration Items.
+  Class aliases: #{CMDB_CLASS_ALIASES.map { |k, v| "#{k}=#{v}" }.join(', ')}
 
-    # sn list / sn query
-    p_list = sub.add_parser("list", aliases=["query", "ls"], help="Query and list tickets")
-    p_list.add_argument("-t", "--table", default="task", help="Table to query (default: task, e.g. incident, sc_req_item)")
-    p_list.add_argument("-m", "--mine", action="store_true", help="Only tickets assigned to me")
-    p_list.add_argument("--caller", help="Filter by caller / opened_by username")
-    p_list.add_argument("-g", "--group", help="Filter by assignment group name (contains)")
-    p_list.add_argument("--state", help="Filter by state value")
-    p_list.add_argument("--priority", help="Filter by priority (e.g. 1, 2, 3)")
-    p_list.add_argument("-s", "--search", help="Search text in short_description or description")
-    p_list.add_argument("-q", "--query", help="Raw ServiceNow sysparm_query string")
-    p_list.add_argument("-a", "--all", action="store_true", help="Include closed/inactive tickets")
-    p_list.add_argument("-f", "--fields", help=f"Comma-separated fields (default: {','.join(DEFAULT_TICKET_FIELDS)})")
-    p_list.add_argument("-l", "--limit", type=int, default=25, help="Max records to return (default: 25)")
-    p_list.add_argument("--sort", default="sys_updated_on", help="Field to sort descending by (default: sys_updated_on)")
-    p_list.add_argument("-o", "--output", choices=["table", "json", "csv", "tsv"], default="table", help="Output format")
+  positional arguments:
+    {list,ls,query,get,create,update}
+      list (ls, query)    Search and list CMDB CIs
+      get                 Get details of a CMDB CI by name, sys_id, serial, or IP
+      create              Create a new CMDB Configuration Item
+      update              Update an existing CMDB Configuration Item
 
-    # sn create
-    p_create = sub.add_parser("create", help="Create a new Incident or ticket")
-    p_create.add_argument("short_description", nargs="?", help="Short description / title of the ticket")
-    p_create.add_argument("-t", "--table", default="incident", help="Table name (default: incident, e.g. change_request, problem)")
-    p_create.add_argument("--title", help="Short description (alternative to positional argument)")
-    p_create.add_argument("-D", "--desc", help="Detailed description")
-    p_create.add_argument("--urgency", help="Urgency (1=High, 2=Medium, 3=Low)")
-    p_create.add_argument("--impact", help="Impact (1=High, 2=Medium, 3=Low)")
-    p_create.add_argument("--priority", help="Priority (normally calculated from impact + urgency)")
-    p_create.add_argument("-g", "--group", help="Assignment group name or sys_id")
-    p_create.add_argument("-a", "--assigned-to", help="Assigned user")
-    p_create.add_argument("--caller", help="Caller username or sys_id")
-    p_create.add_argument("--ci", help="CMDB Configuration Item (cmdb_ci) name or sys_id")
-    p_create.add_argument("--category", help="Category")
-    p_create.add_argument("--subcategory", help="Subcategory")
-    p_create.add_argument("-S", "--set", action="append", metavar="KEY=VAL", help="Set any custom field (repeatable)")
-    p_create.add_argument("-d", "--data", help="Raw JSON object string to merge into payload")
-    p_create.add_argument("--json", action="store_true", help="Output raw JSON")
+  options:
+    -h, --help            Show this help message and exit
+HELP
 
-    # sn update
-    p_update = sub.add_parser("update", help="Update an existing ticket")
-    p_update.add_argument("ticket", help="Ticket number (e.g. INC0012345) or sys_id")
-    p_update.add_argument("-t", "--table", help="Override table name")
-    p_update.add_argument("--state", help="New state (e.g. 'In Progress', 'Resolved', or numeric code)")
-    p_update.add_argument("--title", help="Update short_description")
-    p_update.add_argument("-D", "--desc", help="Update description")
-    p_update.add_argument("--urgency", help="Update urgency (1, 2, 3)")
-    p_update.add_argument("--impact", help="Update impact (1, 2, 3)")
-    p_update.add_argument("--priority", help="Update priority")
-    p_update.add_argument("-g", "--group", help="Update assignment group")
-    p_update.add_argument("-a", "--assigned-to", help="Update assigned_to user")
-    p_update.add_argument("--ci", help="Update CMDB Configuration Item (cmdb_ci)")
-    p_update.add_argument("-c", "--comment", help="Add customer-visible comment")
-    p_update.add_argument("-w", "--work-note", help="Add internal work note")
-    p_update.add_argument("--close-code", help="Resolution code (when resolving/closing)")
-    p_update.add_argument("--close-notes", help="Resolution notes (when resolving/closing)")
-    p_update.add_argument("-S", "--set", action="append", metavar="KEY=VAL", help="Set any custom field (repeatable)")
-    p_update.add_argument("-d", "--data", help="Raw JSON object string to merge into payload")
-    p_update.add_argument("--json", action="store_true", help="Output raw JSON")
+def add_common_ci_mutation_opts(opts, options)
+  opts.on("--ip IP", "IP address") { |v| options[:ip] = v }
+  opts.on("--serial SERIAL", "Serial number") { |v| options[:serial] = v }
+  opts.on("--asset-tag TAG", "Asset tag") { |v| options[:asset_tag] = v }
+  opts.on("--os OS", "Operating system") { |v| options[:os] = v }
+  opts.on("--ram RAM", "RAM in MB") { |v| options[:ram] = v }
+  opts.on("--cpu-count COUNT", "Number of CPUs") { |v| options[:cpu_count] = v }
+  opts.on("--location LOC", "Location name or sys_id") { |v| options[:location] = v }
+  opts.on("-a", "--assigned-to USER", "Assigned user") { |v| options[:assigned_to] = v }
+  opts.on("-g", "--group GROUP", "Support group") { |v| options[:group] = v }
+  opts.on("--status STATUS", "Operational status (e.g. 1=Operational, 2=Non-Operational)") { |v| options[:status] = v }
+  opts.on("-D", "--desc DESC", "Short description") { |v| options[:desc] = v }
+  opts.on("-S", "--set KEY=VAL", "Set arbitrary field (repeatable)") { |v| (options[:set] ||= []) << v }
+  opts.on("-d", "--data JSON", "Raw JSON object string to merge into payload") { |v| options[:data] = v }
+  opts.on("--json", "Output raw JSON") { options[:json] = true }
+end
 
-    # sn comment
-    p_comment = sub.add_parser("comment", help="Add a comment or work note to a ticket")
-    p_comment.add_argument("ticket", help="Ticket number (e.g. INC0012345)")
-    p_comment.add_argument("message", help="Comment or work note text")
-    p_comment.add_argument("-w", "--work-note", action="store_true", help="Post as internal work_notes instead of customer-visible comments")
-    p_comment.add_argument("-t", "--table", help="Override table name")
+def add_profile_opt(opts, options)
+  opts.on("-p", "--profile PROFILE", "Config profile name (default: 'default')") { |v| options[:profile] = v }
+end
 
-    # sn cmdb
-    p_cmdb = sub.add_parser(
-        "cmdb",
-        help="Query, inspect, create, and update CMDB Configuration Items (CIs)",
-        description="Manage ServiceNow CMDB Configuration Items. Class aliases: "
-        + ", ".join(f"{k}={v}" for k, v in CMDB_CLASS_ALIASES.items()),
-    )
-    cmdb_sub = p_cmdb.add_subparsers(dest="cmdb_command", required=True)
+def extract_leading_global_flags(argv, options)
+  rest = argv.dup
+  while !rest.empty?
+    case rest[0]
+    when "-p", "--profile"
+      if rest.length < 2
+        $stderr.puts "Error: #{rest[0]} requires a profile name."
+        exit 1
+      end
+      rest.shift
+      options[:profile] = rest.shift
+    when /\A--profile=(.+)\z/
+      options[:profile] = Regexp.last_match(1)
+      rest.shift
+    when "-h", "--help"
+      puts MAIN_HELP
+      exit 0
+    else
+      break
+    end
+  end
+  rest
+end
 
-    # sn cmdb list
-    p_cmdb_list = cmdb_sub.add_parser("list", aliases=["ls", "query"], help="Search and list CMDB CIs")
-    p_cmdb_list.add_argument(
-        "-c",
-        "--class",
-        dest="ci_class",
-        default="cmdb_ci",
-        help="CI class table or alias (e.g. server, linux, win, computer, vm, netgear, app, service; default: cmdb_ci)",
-    )
-    p_cmdb_list.add_argument("-s", "--search", help="Search across name, IP, serial number, and asset tag")
-    p_cmdb_list.add_argument("--ip", help="Filter by IP address")
-    p_cmdb_list.add_argument("--serial", help="Filter by exact serial number")
-    p_cmdb_list.add_argument("--os", help="Filter by Operating System")
-    p_cmdb_list.add_argument("--status", help="Filter by operational_status")
-    p_cmdb_list.add_argument("-q", "--query", help="Raw ServiceNow sysparm_query")
-    p_cmdb_list.add_argument("-f", "--fields", help=f"Comma-separated fields (default: {','.join(DEFAULT_CMDB_FIELDS)})")
-    p_cmdb_list.add_argument("-l", "--limit", type=int, default=25, help="Max records (default: 25)")
-    p_cmdb_list.add_argument("-o", "--output", choices=["table", "json", "csv", "tsv"], default="table", help="Output format")
+def parse_with_errors(parser, args)
+  parser.parse!(args)
+rescue OptionParser::ParseError => e
+  $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} #{e.message}"
+  $stderr.puts parser.help
+  exit 1
+end
 
-    # sn cmdb get
-    p_cmdb_get = cmdb_sub.add_parser("get", help="Get details of a CMDB CI by name, sys_id, serial, or IP")
-    p_cmdb_get.add_argument("identifier", help="CI name, sys_id, serial number, or IP address")
-    p_cmdb_get.add_argument("-c", "--class", dest="ci_class", default="cmdb_ci", help="CI class table or alias")
-    p_cmdb_get.add_argument("-r", "--relationships", action="store_true", help="Include upstream/downstream CI relationships")
-    p_cmdb_get.add_argument("--json", action="store_true", help="Output raw JSON")
+def main
+  options = { profile: "default", set: [] }
+  args = extract_leading_global_flags(ARGV, options)
 
-    # sn cmdb create
-    p_cmdb_create = cmdb_sub.add_parser("create", help="Create a new CMDB Configuration Item")
-    p_cmdb_create.add_argument("name", nargs="?", help="Name / hostname of the new CI")
-    p_cmdb_create.add_argument(
-        "-c",
-        "--class",
-        dest="ci_class",
-        default="cmdb_ci_server",
-        help="CI class table or alias (default: cmdb_ci_server; e.g. linux, win, computer, vm, app)",
-    )
-    p_cmdb_create.add_argument(
-        "--ire",
-        action="store_true",
-        help="Use CMDB Instance / IRE API (/api/now/cmdb/instance) for duplicate prevention & reconciliation",
-    )
-    p_cmdb_create.add_argument("--source", default="Manual Entry", help="Discovery source when using --ire (default: 'Manual Entry')")
-    add_common_ci_mutation_args(p_cmdb_create)
+  if args.empty?
+    puts MAIN_HELP
+    exit 1
+  end
 
-    # sn cmdb update
-    p_cmdb_update = cmdb_sub.add_parser("update", help="Update an existing CMDB Configuration Item")
-    p_cmdb_update.add_argument("identifier", help="Existing CI name, sys_id, serial number, or IP")
-    p_cmdb_update.add_argument("-c", "--class", dest="ci_class", default="cmdb_ci", help="CI class table or alias")
-    p_cmdb_update.add_argument("--new-name", help="Rename the CI")
-    add_common_ci_mutation_args(p_cmdb_update)
+  command = args.shift
 
-    return parser
+  case command
+  when "config"
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn config [-h] [-p PROFILE]"
+      add_profile_opt(opts, options)
+    end
+    parse_with_errors(parser, args)
+    cmd_config(options)
 
+  when "get"
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn get [-h] [-t TABLE] [-c] [--json] ticket"
+      add_profile_opt(opts, options)
+      opts.on("-t", "--table TABLE", "Override table name (auto-detected from prefix by default)") { |v| options[:table] = v }
+      opts.on("-c", "--comments", "Include comments and work notes") { options[:comments] = true }
+      opts.on("--json", "Output raw JSON") { options[:json] = true }
+    end
+    parse_with_errors(parser, args)
+    if args.empty?
+      $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket"
+      $stderr.puts parser.help
+      exit 1
+    end
+    options[:ticket] = args.shift
+    cmd_get(options)
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+  when "list", "query", "ls"
+    options[:table] = "task"
+    options[:limit] = 25
+    options[:sort] = "sys_updated_on"
+    options[:output] = "table"
 
-    if args.command == "config":
-        cmd_config(args)
-    elif args.command == "get":
-        cmd_get(args)
-    elif args.command in ("list", "query", "ls"):
-        cmd_list(args)
-    elif args.command == "create":
-        cmd_create(args)
-    elif args.command == "update":
-        cmd_update(args)
-    elif args.command == "comment":
-        cmd_comment(args)
-    elif args.command == "cmdb":
-        if args.cmdb_command in ("list", "ls", "query"):
-            cmd_cmdb_list(args)
-        elif args.cmdb_command == "get":
-            cmd_cmdb_get(args)
-        elif args.cmdb_command == "create":
-            cmd_cmdb_create(args)
-        elif args.cmdb_command == "update":
-            cmd_cmdb_update(args)
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn #{command} [-h] [-t TABLE] [-m] [--caller CALLER] [-g GROUP] [--state STATE] [--priority PRIORITY] [-s SEARCH] [-q QUERY] [-a] [-f FIELDS] [-l LIMIT] [--sort SORT] [-o {table,json,csv,tsv}]"
+      add_profile_opt(opts, options)
+      opts.on("-t", "--table TABLE", "Table to query (default: task, e.g. incident, sc_req_item)") { |v| options[:table] = v }
+      opts.on("-m", "--mine", "Only tickets assigned to me") { options[:mine] = true }
+      opts.on("--caller CALLER", "Filter by caller / opened_by username") { |v| options[:caller] = v }
+      opts.on("-g", "--group GROUP", "Filter by assignment group name (contains)") { |v| options[:group] = v }
+      opts.on("--state STATE", "Filter by state value") { |v| options[:state] = v }
+      opts.on("--priority PRIORITY", "Filter by priority (e.g. 1, 2, 3)") { |v| options[:priority] = v }
+      opts.on("-s", "--search SEARCH", "Search text in short_description or description") { |v| options[:search] = v }
+      opts.on("-q", "--query QUERY", "Raw ServiceNow sysparm_query string") { |v| options[:query] = v }
+      opts.on("-a", "--all", "Include closed/inactive tickets") { options[:all] = true }
+      opts.on("-f", "--fields FIELDS", "Comma-separated fields (default: #{DEFAULT_TICKET_FIELDS.join(',')})") { |v| options[:fields] = v }
+      opts.on("-l", "--limit LIMIT", Integer, "Max records to return (default: 25)") { |v| options[:limit] = v }
+      opts.on("--sort SORT", "Field to sort descending by (default: sys_updated_on)") { |v| options[:sort] = v }
+      opts.on("-o", "--output FORMAT", %w[table json csv tsv], "Output format (table, json, csv, tsv)") { |v| options[:output] = v }
+    end
+    parse_with_errors(parser, args)
+    cmd_list(options)
 
+  when "create"
+    options[:table] = "incident"
 
-if __name__ == "__main__":
-    main()
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn create [-h] [-t TABLE] [--title TITLE] [-D DESC] [--urgency URGENCY] [--impact IMPACT] [--priority PRIORITY] [-g GROUP] [-a ASSIGNED_TO] [--caller CALLER] [--ci CI] [--category CATEGORY] [--subcategory SUBCATEGORY] [-S KEY=VAL] [-d DATA] [--json] [short_description]"
+      add_profile_opt(opts, options)
+      opts.on("-t", "--table TABLE", "Table name (default: incident, e.g. change_request, problem)") { |v| options[:table] = v }
+      opts.on("--title TITLE", "Short description (alternative to positional argument)") { |v| options[:title] = v }
+      opts.on("-D", "--desc DESC", "Detailed description") { |v| options[:desc] = v }
+      opts.on("--urgency URGENCY", "Urgency (1=High, 2=Medium, 3=Low)") { |v| options[:urgency] = v }
+      opts.on("--impact IMPACT", "Impact (1=High, 2=Medium, 3=Low)") { |v| options[:impact] = v }
+      opts.on("--priority PRIORITY", "Priority (normally calculated from impact + urgency)") { |v| options[:priority] = v }
+      opts.on("-g", "--group GROUP", "Assignment group name or sys_id") { |v| options[:group] = v }
+      opts.on("-a", "--assigned-to USER", "Assigned user") { |v| options[:assigned_to] = v }
+      opts.on("--caller CALLER", "Caller username or sys_id") { |v| options[:caller] = v }
+      opts.on("--ci CI", "CMDB Configuration Item (cmdb_ci) name or sys_id") { |v| options[:ci] = v }
+      opts.on("--category CATEGORY", "Category") { |v| options[:category] = v }
+      opts.on("--subcategory SUBCATEGORY", "Subcategory") { |v| options[:subcategory] = v }
+      opts.on("-S", "--set KEY=VAL", "Set any custom field (repeatable)") { |v| (options[:set] ||= []) << v }
+      opts.on("-d", "--data JSON", "Raw JSON object string to merge into payload") { |v| options[:data] = v }
+      opts.on("--json", "Output raw JSON") { options[:json] = true }
+    end
+    parse_with_errors(parser, args)
+    options[:short_description] = args.shift unless args.empty?
+    cmd_create(options)
+
+  when "update"
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn update [-h] [-t TABLE] [--state STATE] [--title TITLE] [-D DESC] [--urgency URGENCY] [--impact IMPACT] [--priority PRIORITY] [-g GROUP] [-a ASSIGNED_TO] [--ci CI] [-c COMMENT] [-w WORK_NOTE] [--close-code CLOSE_CODE] [--close-notes CLOSE_NOTES] [-S KEY=VAL] [-d DATA] [--json] ticket"
+      add_profile_opt(opts, options)
+      opts.on("-t", "--table TABLE", "Override table name") { |v| options[:table] = v }
+      opts.on("--state STATE", "New state (e.g. 'In Progress', 'Resolved', or numeric code)") { |v| options[:state] = v }
+      opts.on("--title TITLE", "Update short_description") { |v| options[:title] = v }
+      opts.on("-D", "--desc DESC", "Update description") { |v| options[:desc] = v }
+      opts.on("--urgency URGENCY", "Update urgency (1, 2, 3)") { |v| options[:urgency] = v }
+      opts.on("--impact IMPACT", "Update impact (1, 2, 3)") { |v| options[:impact] = v }
+      opts.on("--priority PRIORITY", "Update priority") { |v| options[:priority] = v }
+      opts.on("-g", "--group GROUP", "Update assignment group") { |v| options[:group] = v }
+      opts.on("-a", "--assigned-to USER", "Update assigned_to user") { |v| options[:assigned_to] = v }
+      opts.on("--ci CI", "Update CMDB Configuration Item (cmdb_ci)") { |v| options[:ci] = v }
+      opts.on("-c", "--comment COMMENT", "Add customer-visible comment") { |v| options[:comment] = v }
+      opts.on("-w", "--work-note WORK_NOTE", "Add internal work note") { |v| options[:work_note] = v }
+      opts.on("--close-code CODE", "Resolution code (when resolving/closing)") { |v| options[:close_code] = v }
+      opts.on("--close-notes NOTES", "Resolution notes (when resolving/closing)") { |v| options[:close_notes] = v }
+      opts.on("-S", "--set KEY=VAL", "Set any custom field (repeatable)") { |v| (options[:set] ||= []) << v }
+      opts.on("-d", "--data JSON", "Raw JSON object string to merge into payload") { |v| options[:data] = v }
+      opts.on("--json", "Output raw JSON") { options[:json] = true }
+    end
+    parse_with_errors(parser, args)
+    if args.empty?
+      $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket"
+      $stderr.puts parser.help
+      exit 1
+    end
+    options[:ticket] = args.shift
+    cmd_update(options)
+
+  when "comment"
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn comment [-h] [-w] [-t TABLE] ticket message"
+      add_profile_opt(opts, options)
+      opts.on("-w", "--work-note", "Post as internal work_notes instead of customer-visible comments") { options[:work_note] = true }
+      opts.on("-t", "--table TABLE", "Override table name") { |v| options[:table] = v }
+    end
+    parse_with_errors(parser, args)
+    if args.length < 2
+      $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket, message"
+      $stderr.puts parser.help
+      exit 1
+    end
+    options[:ticket] = args.shift
+    options[:message] = args.shift
+    cmd_comment(options)
+
+  when "cmdb"
+    if args.empty? || %w[-h --help].include?(args[0])
+      puts CMDB_HELP
+      exit(args.empty? ? 1 : 0)
+    end
+    cmdb_cmd = args.shift
+
+    case cmdb_cmd
+    when "list", "ls", "query"
+      options[:ci_class] = "cmdb_ci"
+      options[:limit] = 25
+      options[:output] = "table"
+
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: sn cmdb #{cmdb_cmd} [-h] [-c CI_CLASS] [-s SEARCH] [--ip IP] [--serial SERIAL] [--os OS] [--status STATUS] [-q QUERY] [-f FIELDS] [-l LIMIT] [-o {table,json,csv,tsv}]"
+        add_profile_opt(opts, options)
+        opts.on("-c", "--class CI_CLASS", "CI class table or alias (e.g. server, linux, win, computer, vm, netgear, app, service; default: cmdb_ci)") { |v| options[:ci_class] = v }
+        opts.on("-s", "--search SEARCH", "Search across name, IP, serial number, and asset tag") { |v| options[:search] = v }
+        opts.on("--ip IP", "Filter by IP address") { |v| options[:ip] = v }
+        opts.on("--serial SERIAL", "Filter by exact serial number") { |v| options[:serial] = v }
+        opts.on("--os OS", "Filter by Operating System") { |v| options[:os] = v }
+        opts.on("--status STATUS", "Filter by operational_status") { |v| options[:status] = v }
+        opts.on("-q", "--query QUERY", "Raw ServiceNow sysparm_query") { |v| options[:query] = v }
+        opts.on("-f", "--fields FIELDS", "Comma-separated fields (default: #{DEFAULT_CMDB_FIELDS.join(',')})") { |v| options[:fields] = v }
+        opts.on("-l", "--limit LIMIT", Integer, "Max records (default: 25)") { |v| options[:limit] = v }
+        opts.on("-o", "--output FORMAT", %w[table json csv tsv], "Output format (table, json, csv, tsv)") { |v| options[:output] = v }
+      end
+      parse_with_errors(parser, args)
+      cmd_cmdb_list(options)
+
+    when "get"
+      options[:ci_class] = "cmdb_ci"
+
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: sn cmdb get [-h] [-c CI_CLASS] [-r] [--json] identifier"
+        add_profile_opt(opts, options)
+        opts.on("-c", "--class CI_CLASS", "CI class table or alias") { |v| options[:ci_class] = v }
+        opts.on("-r", "--relationships", "Include upstream/downstream CI relationships") { options[:relationships] = true }
+        opts.on("--json", "Output raw JSON") { options[:json] = true }
+      end
+      parse_with_errors(parser, args)
+      if args.empty?
+        $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: identifier"
+        $stderr.puts parser.help
+        exit 1
+      end
+      options[:identifier] = args.shift
+      cmd_cmdb_get(options)
+
+    when "create"
+      options[:ci_class] = "cmdb_ci_server"
+      options[:source] = "Manual Entry"
+
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: sn cmdb create [-h] [-c CI_CLASS] [--ire] [--source SOURCE] [options] [name]"
+        add_profile_opt(opts, options)
+        opts.on("-c", "--class CI_CLASS", "CI class table or alias (default: cmdb_ci_server; e.g. linux, win, computer, vm, app)") { |v| options[:ci_class] = v }
+        opts.on("--ire", "Use CMDB Instance / IRE API (/api/now/cmdb/instance) for duplicate prevention & reconciliation") { options[:ire] = true }
+        opts.on("--source SOURCE", "Discovery source when using --ire (default: 'Manual Entry')") { |v| options[:source] = v }
+        add_common_ci_mutation_opts(opts, options)
+      end
+      parse_with_errors(parser, args)
+      options[:name] = args.shift unless args.empty?
+      cmd_cmdb_create(options)
+
+    when "update"
+      options[:ci_class] = "cmdb_ci"
+
+      parser = OptionParser.new do |opts|
+        opts.banner = "usage: sn cmdb update [-h] [-c CI_CLASS] [--new-name NEW_NAME] [options] identifier"
+        add_profile_opt(opts, options)
+        opts.on("-c", "--class CI_CLASS", "CI class table or alias") { |v| options[:ci_class] = v }
+        opts.on("--new-name NEW_NAME", "Rename the CI") { |v| options[:new_name] = v }
+        add_common_ci_mutation_opts(opts, options)
+      end
+      parse_with_errors(parser, args)
+      if args.empty?
+        $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: identifier"
+        $stderr.puts parser.help
+        exit 1
+      end
+      options[:identifier] = args.shift
+      cmd_cmdb_update(options)
+
+    else
+      $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Unknown cmdb subcommand '#{cmdb_cmd}'."
+      $stderr.puts CMDB_HELP
+      exit 1
+    end
+
+  else
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Unknown command '#{command}'."
+    $stderr.puts MAIN_HELP
+    exit 1
+  end
+end
+
+main if __FILE__ == $PROGRAM_NAME

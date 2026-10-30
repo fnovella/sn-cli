@@ -1,12 +1,12 @@
 # sn-cli — Standalone ServiceNow CLI
 
-A fast, zero-dependency command-line interface (`sn`) for querying, creating, and updating ServiceNow tickets and **CMDB Configuration Items (CIs)** directly from the terminal. Built using only the Python 3 standard library.
+A fast, zero-dependency command-line interface (`sn`) for querying, creating, and updating ServiceNow tickets and **CMDB Configuration Items (CIs)** directly from the terminal. Built using only the Ruby standard library.
 
 ---
 
 ## Features
 
-- **Zero External Dependencies**: Uses Python 3 standard library only (`urllib`, `argparse`, `json`, `csv`). No `pip install` or virtual environment required.
+- **Zero External Dependencies**: Uses Ruby standard library only (`net/http`, `optparse`, `json`, `uri`, `io/console`, `csv`). No `gem install` or `bundle install` required.
 - **Full Ticket Lifecycle**: Query (`sn list`), inspect (`sn get`), create (`sn create`), update/resolve (`sn update`), and comment (`sn comment`) on Incidents, Change Requests, Requested Items, Catalog Tasks, and Problems.
 - **CMDB Management (`sn cmdb`)**: Search, inspect (including CI upstream/downstream relationships), create, and update CMDB Configuration Items via either the direct **Table API** or ServiceNow's **Identification and Reconciliation Engine (IRE)** (`--ire`).
 - **Smart Table & Class Detection**:
