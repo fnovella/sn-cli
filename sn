@@ -78,6 +78,8 @@ module Colors
   CYAN    = ENABLED ? "\e[36m" : ""
   GREEN   = ENABLED ? "\e[32m" : ""
   YELLOW  = ENABLED ? "\e[33m" : ""
+  BLUE    = ENABLED ? "\e[34m" : ""
+  MAGENTA = ENABLED ? "\e[35m" : ""
   RED     = ENABLED ? "\e[31m" : ""
   RESET   = ENABLED ? "\e[0m"  : ""
 end
@@ -949,62 +951,100 @@ end
 # Argument Parsing & CLI Dispatch
 # ---------------------------------------------------------------------------
 
-MAIN_HELP = <<~HELP
-  usage: sn [-h] [-p PROFILE] {config,get,list,query,ls,create,update,comment,cmdb} ...
+def main_help
+  c = Colors
+  <<~HELP
+    #{c::BOLD}#{c::YELLOW}usage:#{c::RESET} #{c::BOLD}#{c::CYAN}sn#{c::RESET} [#{c::GREEN}-h#{c::RESET}] [#{c::GREEN}-p#{c::RESET} #{c::CYAN}PROFILE#{c::RESET}] #{c::MAGENTA}{config,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET} ...
 
-  ServiceNow CLI for querying, creating, and updating tickets and CMDB items.
+    #{c::BOLD}ServiceNow CLI for querying, creating, and updating tickets and CMDB items.#{c::RESET}
 
-  positional arguments:
-    {config,get,list,query,ls,create,update,comment,cmdb}
-      config              Configure ServiceNow instance URL and credentials
-      get                 Get details of a single ticket by Number or sys_id
-      list (query, ls)    Query and list tickets
-      create              Create a new Incident or ticket
-      update              Update an existing ticket
-      comment             Add a comment or work note to a ticket
-      cmdb                Query, inspect, create, and update CMDB Configuration Items (CIs)
+    #{c::BOLD}#{c::YELLOW}positional arguments:#{c::RESET}
+      #{c::MAGENTA}{config,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET}
+        #{c::BOLD}#{c::CYAN}config#{c::RESET}              Configure ServiceNow instance URL and credentials
+        #{c::BOLD}#{c::CYAN}get#{c::RESET}                 Get details of a single ticket by Number or sys_id
+        #{c::BOLD}#{c::CYAN}list#{c::RESET} #{c::DIM}(query, ls)#{c::RESET}    Query and list tickets
+        #{c::BOLD}#{c::CYAN}create#{c::RESET}              Create a new Incident or ticket
+        #{c::BOLD}#{c::CYAN}update#{c::RESET}              Update an existing ticket
+        #{c::BOLD}#{c::CYAN}comment#{c::RESET}             Add a comment or work note to a ticket
+        #{c::BOLD}#{c::CYAN}cmdb#{c::RESET}                Query, inspect, create, and update CMDB Configuration Items (CIs)
+        #{c::BOLD}#{c::CYAN}help#{c::RESET}                Show help for sn or a specific subcommand
 
-  options:
-    -h, --help            Show this help message and exit
-    -p, --profile PROFILE Config profile name (default: 'default')
+    #{c::BOLD}#{c::YELLOW}options:#{c::RESET}
+      #{c::BOLD}#{c::GREEN}-h#{c::RESET}, #{c::BOLD}#{c::GREEN}--help#{c::RESET}            Show this help message and exit
+      #{c::BOLD}#{c::GREEN}-p#{c::RESET}, #{c::BOLD}#{c::GREEN}--profile#{c::RESET} #{c::CYAN}PROFILE#{c::RESET} Config profile name #{c::DIM}(default: 'default')#{c::RESET}
 
-  Examples:
-    # Setup
-    sn config
+    #{c::BOLD}#{c::YELLOW}Examples:#{c::RESET}
+      #{c::DIM}# Setup#{c::RESET}
+      #{c::CYAN}sn config#{c::RESET}
 
-    # Query & Inspect Tickets
-    sn get INC0010001 --comments
-    sn list --mine
-    sn list -t incident --priority 1
+      #{c::DIM}# Query & Inspect Tickets#{c::RESET}
+      #{c::CYAN}sn get#{c::RESET} INC0010001 #{c::GREEN}--comments#{c::RESET}
+      #{c::CYAN}sn list#{c::RESET} #{c::GREEN}--mine#{c::RESET}
+      #{c::CYAN}sn list#{c::RESET} #{c::GREEN}-t#{c::RESET} incident #{c::GREEN}--priority#{c::RESET} 1
 
-    # Create & Update Incidents / Tickets
-    sn create "VPN Down in Madrid" -D "Users cannot connect" --urgency 1 --impact 2 -g "Network"
-    sn update INC0010001 --state "In Progress" -a fnovella -w "Investigating firewall"
-    sn comment INC0010001 "Issue resolved" --work-note
+      #{c::DIM}# Create & Update Incidents / Tickets#{c::RESET}
+      #{c::CYAN}sn create#{c::RESET} "VPN Down in Madrid" #{c::GREEN}-D#{c::RESET} "Users cannot connect" #{c::GREEN}--urgency#{c::RESET} 1 #{c::GREEN}--impact#{c::RESET} 2 #{c::GREEN}-g#{c::RESET} "Network"
+      #{c::CYAN}sn update#{c::RESET} INC0010001 #{c::GREEN}--state#{c::RESET} "In Progress" #{c::GREEN}-a#{c::RESET} fnovella #{c::GREEN}-w#{c::RESET} "Investigating firewall"
+      #{c::CYAN}sn comment#{c::RESET} INC0010001 "Issue resolved" #{c::GREEN}--work-note#{c::RESET}
 
-    # Query, Create & Update CMDB Configuration Items
-    sn cmdb list -c linux -s "mad"
-    sn cmdb get srv-linux-mad01 --relationships
-    sn cmdb create srv-linux-mad02 -c linux --ip 10.20.30.40 --serial SN12345 --os "Linux Red Hat"
-    sn cmdb update srv-linux-mad02 --ram 32768 -S environment=Production
-HELP
+      #{c::DIM}# Query, Create & Update CMDB Configuration Items#{c::RESET}
+      #{c::CYAN}sn cmdb list#{c::RESET} #{c::GREEN}-c#{c::RESET} linux #{c::GREEN}-s#{c::RESET} "mad"
+      #{c::CYAN}sn cmdb get#{c::RESET} srv-linux-mad01 #{c::GREEN}--relationships#{c::RESET}
+      #{c::CYAN}sn cmdb create#{c::RESET} srv-linux-mad02 #{c::GREEN}-c#{c::RESET} linux #{c::GREEN}--ip#{c::RESET} 10.20.30.40 #{c::GREEN}--serial#{c::RESET} SN12345 #{c::GREEN}--os#{c::RESET} "Linux Red Hat"
+      #{c::CYAN}sn cmdb update#{c::RESET} srv-linux-mad02 #{c::GREEN}--ram#{c::RESET} 32768 #{c::GREEN}-S#{c::RESET} environment=Production
+  HELP
+end
 
-CMDB_HELP = <<~HELP
-  usage: sn cmdb [-h] {list,ls,query,get,create,update} ...
+def cmdb_help
+  c = Colors
+  aliases_str = CMDB_CLASS_ALIASES.map { |k, v| "#{c::BOLD}#{c::CYAN}#{k}#{c::RESET}#{c::DIM}=#{v}#{c::RESET}" }.join(", ")
+  <<~HELP
+    #{c::BOLD}#{c::YELLOW}usage:#{c::RESET} #{c::BOLD}#{c::CYAN}sn cmdb#{c::RESET} [#{c::GREEN}-h#{c::RESET}] #{c::MAGENTA}{list,ls,query,get,create,update,help}#{c::RESET} ...
 
-  Manage ServiceNow CMDB Configuration Items.
-  Class aliases: #{CMDB_CLASS_ALIASES.map { |k, v| "#{k}=#{v}" }.join(', ')}
+    #{c::BOLD}Manage ServiceNow CMDB Configuration Items.#{c::RESET}
+    #{c::BOLD}#{c::YELLOW}Class aliases:#{c::RESET} #{aliases_str}
 
-  positional arguments:
-    {list,ls,query,get,create,update}
-      list (ls, query)    Search and list CMDB CIs
-      get                 Get details of a CMDB CI by name, sys_id, serial, or IP
-      create              Create a new CMDB Configuration Item
-      update              Update an existing CMDB Configuration Item
+    #{c::BOLD}#{c::YELLOW}positional arguments:#{c::RESET}
+      #{c::MAGENTA}{list,ls,query,get,create,update,help}#{c::RESET}
+        #{c::BOLD}#{c::CYAN}list#{c::RESET} #{c::DIM}(ls, query)#{c::RESET}    Search and list CMDB CIs
+        #{c::BOLD}#{c::CYAN}get#{c::RESET}                 Get details of a CMDB CI by name, sys_id, serial, or IP
+        #{c::BOLD}#{c::CYAN}create#{c::RESET}              Create a new CMDB Configuration Item
+        #{c::BOLD}#{c::CYAN}update#{c::RESET}              Update an existing CMDB Configuration Item
+        #{c::BOLD}#{c::CYAN}help#{c::RESET}                Show help for cmdb or a cmdb subcommand
 
-  options:
-    -h, --help            Show this help message and exit
-HELP
+    #{c::BOLD}#{c::YELLOW}options:#{c::RESET}
+      #{c::BOLD}#{c::GREEN}-h#{c::RESET}, #{c::BOLD}#{c::GREEN}--help#{c::RESET}            Show this help message and exit
+  HELP
+end
+
+def colorize_parser_help(help_str)
+  return help_str unless Colors::ENABLED
+
+  c = Colors
+  help_str.lines.map do |line|
+    if line.start_with?("usage:")
+      line
+        .sub(/\Ausage:\s+(sn(?:\s+\S+)?)/, "#{c::BOLD}#{c::YELLOW}usage:#{c::RESET} #{c::BOLD}#{c::CYAN}\\1#{c::RESET}")
+        .gsub(/(\[-[^\]]+\])/) do |m|
+          m.gsub(/(-\w|--[\w-]+)/, "#{c::GREEN}\\1#{c::RESET}")
+           .gsub(/\b([A-Z_]{2,}|\{[^}]+\})\b/, "#{c::CYAN}\\1#{c::RESET}")
+        end
+    elsif line.chomp =~ /\A(\s*)(-\w(?:,\s*--[\w-]+)?|--[\w-]+)(\s+[A-Z_=]+|\s+\{[^}]+\})?(\s{2,})(.*)\z/
+      indent = Regexp.last_match(1)
+      flags = Regexp.last_match(2)
+      metavar = Regexp.last_match(3).to_s
+      gap = Regexp.last_match(4)
+      desc = Regexp.last_match(5)
+
+      colored_flags = flags.gsub(/(-\w|--[\w-]+)/, "#{c::BOLD}#{c::GREEN}\\1#{c::RESET}")
+      colored_meta = metavar.empty? ? "" : "#{c::CYAN}#{metavar}#{c::RESET}"
+      colored_desc = desc.gsub(/(\((?:default|e\.g\.)[^)]*\))/, "#{c::DIM}\\1#{c::RESET}")
+      "#{indent}#{colored_flags}#{colored_meta}#{gap}#{colored_desc}\n"
+    else
+      line
+    end
+  end.join
+end
 
 def add_common_ci_mutation_opts(opts, options)
   opts.on("--ip IP", "IP address") { |v| options[:ip] = v }
@@ -1025,6 +1065,10 @@ end
 
 def add_profile_opt(opts, options)
   opts.on("-p", "--profile PROFILE", "Config profile name (default: 'default')") { |v| options[:profile] = v }
+  opts.on_tail("-h", "--help", "Show this help message and exit") do
+    puts colorize_parser_help(opts.help)
+    exit 0
+  end
 end
 
 def extract_leading_global_flags(argv, options)
@@ -1042,7 +1086,7 @@ def extract_leading_global_flags(argv, options)
       options[:profile] = Regexp.last_match(1)
       rest.shift
     when "-h", "--help"
-      puts MAIN_HELP
+      puts main_help
       exit 0
     else
       break
@@ -1055,7 +1099,7 @@ def parse_with_errors(parser, args)
   parser.parse!(args)
 rescue OptionParser::ParseError => e
   $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} #{e.message}"
-  $stderr.puts parser.help
+  $stderr.puts colorize_parser_help(parser.help)
   exit 1
 end
 
@@ -1064,8 +1108,17 @@ def main
   args = extract_leading_global_flags(ARGV, options)
 
   if args.empty?
-    puts MAIN_HELP
+    puts main_help
     exit 1
+  end
+
+  if args[0] == "help"
+    args.shift
+    if args.empty?
+      puts main_help
+      exit 0
+    end
+    args << "--help"
   end
 
   command = args.shift
@@ -1090,7 +1143,7 @@ def main
     parse_with_errors(parser, args)
     if args.empty?
       $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket"
-      $stderr.puts parser.help
+      $stderr.puts colorize_parser_help(parser.help)
       exit 1
     end
     options[:ticket] = args.shift
@@ -1173,7 +1226,7 @@ def main
     parse_with_errors(parser, args)
     if args.empty?
       $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket"
-      $stderr.puts parser.help
+      $stderr.puts colorize_parser_help(parser.help)
       exit 1
     end
     options[:ticket] = args.shift
@@ -1189,7 +1242,7 @@ def main
     parse_with_errors(parser, args)
     if args.length < 2
       $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: ticket, message"
-      $stderr.puts parser.help
+      $stderr.puts colorize_parser_help(parser.help)
       exit 1
     end
     options[:ticket] = args.shift
@@ -1198,8 +1251,16 @@ def main
 
   when "cmdb"
     if args.empty? || %w[-h --help].include?(args[0])
-      puts CMDB_HELP
+      puts cmdb_help
       exit(args.empty? ? 1 : 0)
+    end
+    if args[0] == "help"
+      args.shift
+      if args.empty? || %w[-h --help].include?(args[0])
+        puts cmdb_help
+        exit 0
+      end
+      args << "--help"
     end
     cmdb_cmd = args.shift
 
@@ -1239,7 +1300,7 @@ def main
       parse_with_errors(parser, args)
       if args.empty?
         $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: identifier"
-        $stderr.puts parser.help
+        $stderr.puts colorize_parser_help(parser.help)
         exit 1
       end
       options[:identifier] = args.shift
@@ -1274,7 +1335,7 @@ def main
       parse_with_errors(parser, args)
       if args.empty?
         $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} the following arguments are required: identifier"
-        $stderr.puts parser.help
+        $stderr.puts colorize_parser_help(parser.help)
         exit 1
       end
       options[:identifier] = args.shift
@@ -1282,13 +1343,13 @@ def main
 
     else
       $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Unknown cmdb subcommand '#{cmdb_cmd}'."
-      $stderr.puts CMDB_HELP
+      $stderr.puts cmdb_help
       exit 1
     end
 
   else
     $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Unknown command '#{command}'."
-    $stderr.puts MAIN_HELP
+    $stderr.puts main_help
     exit 1
   end
 end
