@@ -651,6 +651,7 @@ def cmd_list(options)
     query_parts << "assigned_to.user_name=#{user}"
   end
 
+  query_parts << "assignment_groupDYNAMICd6435e965f510100a9ad2572f2b47744" if options[:my_groups]
   query_parts << "caller_id.user_name=#{options[:caller]}^ORopened_by.user_name=#{options[:caller]}" if options[:caller]
   query_parts << "assignment_group.nameLIKE#{options[:group]}" if options[:group]
   query_parts << "state=#{options[:state]}" if options[:state]
@@ -1160,6 +1161,7 @@ def main_help
       #{c::DIM}# Query & Inspect Tickets#{c::RESET}
       #{c::CYAN}sn get#{c::RESET} INC0010001 #{c::GREEN}--comments#{c::RESET}
       #{c::CYAN}sn list#{c::RESET} #{c::GREEN}--mine#{c::RESET}
+      #{c::CYAN}sn list#{c::RESET} #{c::GREEN}--my-groups#{c::RESET}
       #{c::CYAN}sn list#{c::RESET} #{c::GREEN}-t#{c::RESET} incident #{c::GREEN}--priority#{c::RESET} 1
 
       #{c::DIM}# Create & Update Incidents / Tickets#{c::RESET}
@@ -1337,10 +1339,11 @@ def main
     options[:output] = "table"
 
     parser = OptionParser.new do |opts|
-      opts.banner = "usage: sn #{command} [-h] [-t TABLE] [-m] [--caller CALLER] [-g GROUP] [--state STATE] [--priority PRIORITY] [-s SEARCH] [-q QUERY] [-a] [-f FIELDS] [-l LIMIT] [--sort SORT] [-o {table,json,csv,tsv}]"
+      opts.banner = "usage: sn #{command} [-h] [-t TABLE] [-m] [-G] [--caller CALLER] [-g GROUP] [--state STATE] [--priority PRIORITY] [-s SEARCH] [-q QUERY] [-a] [-f FIELDS] [-l LIMIT] [--sort SORT] [-o {table,json,csv,tsv}]"
       add_profile_opt(opts, options)
       opts.on("-t", "--table TABLE", "Table to query (default: task, e.g. incident, sc_req_item)") { |v| options[:table] = v }
       opts.on("-m", "--mine", "Only tickets assigned to me") { options[:mine] = true }
+      opts.on("-G", "--my-groups", "Only tickets assigned to my groups") { options[:my_groups] = true }
       opts.on("--caller CALLER", "Filter by caller / opened_by username") { |v| options[:caller] = v }
       opts.on("-g", "--group GROUP", "Filter by assignment group name (contains)") { |v| options[:group] = v }
       opts.on("--state STATE", "Filter by state value") { |v| options[:state] = v }

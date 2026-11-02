@@ -113,6 +113,10 @@ By default, `sn list` queries active tickets across the base `task` table (which
 # Active tickets assigned to you
 sn list --mine
 
+# Active tickets (Incidents, Tasks, RITMs, Changes, etc.) assigned to any of your groups
+sn list --my-groups
+sn list -G -t incident
+
 # Active P1 incidents
 sn list -t incident --priority 1
 
