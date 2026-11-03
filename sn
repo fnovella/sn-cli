@@ -384,8 +384,8 @@ def prompt_input(prompt_text)
   return "" if first.nil?
 
   lines = [first]
-  if first.lstrip.start_with?("curl ") || first.rstrip.end_with?("\\")
-    while lines.last.rstrip.end_with?("\\") || IO.select([$stdin], nil, nil, 0.05)
+  if first.lstrip.start_with?("curl ") || first.rstrip.end_with?("\\", "^")
+    while lines.last.rstrip.end_with?("\\", "^") || (!Gem.win_platform? && IO.select([$stdin], nil, nil, 0.05))
       nxt = $stdin.gets
       break if nxt.nil?
 
@@ -408,12 +408,21 @@ def prompt_secret(prompt_text)
 end
 
 def read_clipboard_text
-  [
-    ["wl-paste", "--no-newline"],
-    ["xclip", "-selection", "clipboard", "-o"],
-    ["xsel", "--clipboard", "--output"],
-    ["pbpaste"]
-  ].each do |cmd|
+  cmds = if Gem.win_platform?
+           [
+             ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"],
+             ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]
+           ]
+         else
+           [
+             ["wl-paste", "--no-newline"],
+             ["xclip", "-selection", "clipboard", "-o"],
+             ["xsel", "--clipboard", "--output"],
+             ["pbpaste"]
+           ]
+         end
+
+  cmds.each do |cmd|
     begin
       IO.popen(cmd, err: File::NULL) do |io|
         out = io.read
@@ -428,8 +437,17 @@ def read_clipboard_text
 end
 
 def parse_curl_command(text)
-  cleaned = text.to_s.gsub(/\\\r?\n/, " ").strip
-  return nil unless cleaned.match?(/\Acurl\b/i)
+  raw = text.to_s
+  # Normalize both POSIX (\) and Windows cmd.exe (^) line continuations and caret-escapes
+  if raw.include?("^\"") || raw.match?(/\^\r?\n/)
+    cleaned = raw.gsub(/\^\r?\n/, " ")
+                 .gsub('^"', '"')
+                 .gsub(/\^([&|<>%^])/, '\1')
+                 .strip
+  else
+    cleaned = raw.gsub(/\\\r?\n/, " ").strip
+  end
+  return nil unless cleaned.match?(/\Acurl(?:\.exe)?\b/i)
 
   instance = nil
   cookies = []
