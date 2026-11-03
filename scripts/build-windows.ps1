@@ -25,9 +25,11 @@ $ExtractedRoot = (Get-ChildItem -Path $BuildDir -Directory | Where-Object { $_.N
 $RuntimeDir = Join-Path $BuildDir "runtime"
 New-Item -ItemType Directory -Path $RuntimeDir | Out-Null
 
-# Copy only required runtime folders (bin with builtin DLLs, stdlib, site_ruby, and ssl certs)
+# Copy only required runtime folders (bin with builtin DLLs, stdlib, site_ruby, and default gem specs)
 Copy-Item -Recurse (Join-Path $ExtractedRoot "bin") (Join-Path $RuntimeDir "bin")
-Copy-Item -Recurse (Join-Path $ExtractedRoot "ssl") (Join-Path $RuntimeDir "ssl")
+if (Test-Path (Join-Path $ExtractedRoot "ssl")) {
+    Copy-Item -Recurse (Join-Path $ExtractedRoot "ssl") (Join-Path $RuntimeDir "ssl")
+}
 
 $LibRubySrc = Join-Path $ExtractedRoot "lib\ruby"
 $LibRubyDst = Join-Path $RuntimeDir "lib\ruby"
@@ -38,6 +40,11 @@ if (Test-Path (Join-Path $LibRubySrc "site_ruby")) {
 }
 if (Test-Path (Join-Path $LibRubySrc "vendor_ruby")) {
     Copy-Item -Recurse (Join-Path $LibRubySrc "vendor_ruby") (Join-Path $LibRubyDst "vendor_ruby")
+}
+if (Test-Path (Join-Path $LibRubySrc "gems\3.3.0\specifications\default")) {
+    $DefSpecDst = Join-Path $LibRubyDst "gems\3.3.0\specifications"
+    New-Item -ItemType Directory -Force -Path $DefSpecDst | Out-Null
+    Copy-Item -Recurse (Join-Path $LibRubySrc "gems\3.3.0\specifications\default") (Join-Path $DefSpecDst "default")
 }
 
 # Copy the sn script into the portable runtime
