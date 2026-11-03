@@ -23,6 +23,8 @@ A fast, zero-dependency command-line interface (`sn`) for querying, creating, an
 
 ## Installation
 
+### Linux / macOS
+
 Clone the repository and symlink `sn` into your `~/.local/bin` (or any directory in your `$PATH`):
 
 ```bash
@@ -37,6 +39,21 @@ Verify installation:
 sn --help
 ```
 
+### Windows (Standalone `sn.exe`)
+
+No Ruby installation is required on Windows:
+
+1. **Download Prebuilt `sn.exe`:**
+   - Download `sn.exe` from the [GitHub Releases](https://github.com/fnovella/sn-cli/releases) page or the `sn-windows-x64` artifact from the latest [GitHub Actions](https://github.com/fnovella/sn-cli/actions) run.
+   - Place `sn.exe` in any directory on your `PATH` (e.g., `C:\Users\<you>\bin`).
+   - On first run, `sn.exe` unpacks its embedded portable runtime once into `%LOCALAPPDATA%\sn-cli\rt-<hash>`, making all subsequent invocations instantaneous.
+
+2. **Build `sn.exe` Yourself on Windows:**
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+   # Output: .\dist\sn.exe
+   ```
+
 ---
 
 ## Configuration & Authentication
@@ -49,7 +66,7 @@ Run `sn config` to set up your default profile:
 sn config
 ```
 
-Credentials are saved in `~/.config/servicenow/config.json` with `0600` (owner-only read/write) permissions.
+Credentials are saved in `~/.config/servicenow/config.json` (`%USERPROFILE%\.config\servicenow\config.json` on Windows) with `0600` permissions.
 
 To configure additional profiles (e.g., a development or staging instance):
 
@@ -66,9 +83,9 @@ sn -p dev list --mine
    Sends `Authorization: Bearer <token>`.
 3. **`cookie` (Enterprise SSO / Browser Session)**
    If your organization enforces SAML/Entra ID SSO and blocks basic authentication:
-   - Open your ServiceNow instance in Chrome/Firefox and open DevTools (`F12` -> **Network** tab).
-   - Right-click any `/api/now/...` request and select **Copy** -> **Copy as cURL**.
-   - Run `sn config` (or `sn config --curl`)—it will automatically detect the `Copy as cURL` command in your clipboard (or let you paste it directly) and extract your instance URL, `Cookie`, and `X-UserToken` automatically.
+   - Open your ServiceNow instance in Chrome/Edge/Firefox and open DevTools (`F12` -> **Network** tab).
+   - Right-click any `/api/now/...` request and select **Copy** -> **Copy as cURL** (supports both *Copy as cURL (bash)* and Windows *Copy as cURL (cmd)*).
+   - Run `sn config` (or `sn config --curl`)—it will automatically detect the `Copy as cURL` command in your clipboard on Linux, macOS, and Windows (or let you paste it directly) and extract your instance URL, `Cookie`, and `X-UserToken` automatically.
 
 ### Environment Variables
 
