@@ -97,10 +97,11 @@ internal static class Program
     {
         try
         {
-            foreach (int handleId in new[] { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE })
+            foreach (int handleId in new int[] { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE })
             {
                 IntPtr handle = GetStdHandle(handleId);
-                if (handle != IntPtr.Zero && GetConsoleMode(handle, out uint mode))
+                uint mode;
+                if (handle != IntPtr.Zero && GetConsoleMode(handle, out mode))
                 {
                     SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
                 }
