@@ -3,8 +3,8 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildDir = Join-Path $RepoRoot "build\win"
 $DistDir  = Join-Path $RepoRoot "dist"
-$RubyVer  = "3.3.7-1"
-$RubyUrl  = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-$RubyVer/ruby-$RubyVer-x64.7z"
+$RubyVer  = "3.3.13-1"
+$RubyUrl  = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-$RubyVer/rubyinstaller-$RubyVer-x64.7z"
 
 Write-Host "==> Preparing build directories..."
 if (Test-Path $BuildDir) { Remove-Item -Recurse -Force $BuildDir }
@@ -13,11 +13,14 @@ New-Item -ItemType Directory -Path $BuildDir | Out-Null
 
 $Archive7z = Join-Path $BuildDir "ruby.7z"
 Write-Host "==> Downloading portable RubyInstaller ($RubyVer)..."
-Invoke-WebRequest -Uri $RubyUrl -OutFile $Archive7z -UseBasicParsing
+& curl.exe -fsSL -o $Archive7z $RubyUrl
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to download $RubyUrl"
+}
 
 Write-Host "==> Extracting portable Ruby..."
 7z x $Archive7z "-o$BuildDir" -y | Out-Null
-$ExtractedRoot = Join-Path $BuildDir "ruby-$RubyVer-x64"
+$ExtractedRoot = (Get-ChildItem -Path $BuildDir -Directory | Where-Object { $_.Name -like "ruby*" } | Select-Object -First 1).FullName
 
 $RuntimeDir = Join-Path $BuildDir "runtime"
 New-Item -ItemType Directory -Path $RuntimeDir | Out-Null
