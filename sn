@@ -4,12 +4,17 @@
 # sn - Standalone ServiceNow CLI for querying, creating, and updating tickets and CMDB items.
 # Zero external dependencies (uses Ruby standard library only).
 
+require "digest/sha1"
 require "fileutils"
 require "io/console"
+require "io/wait"
 require "json"
 require "net/http"
 require "optparse"
+require "securerandom"
 require "shellwords"
+require "socket"
+require "tmpdir"
 require "uri"
 
 begin
@@ -19,6 +24,7 @@ rescue LoadError
 end
 
 CONFIG_PATH = File.join(Dir.home, ".config", "servicenow", "config.json")
+BROWSER_PROFILE_DIR = File.join(Dir.home, ".config", "servicenow", "browser")
 
 PREFIX_TABLE_MAP = {
   "INC"    => "incident",
@@ -285,6 +291,9 @@ def sn_request(cfg, method, path, params: nil, body: nil)
       end
       $stderr.puts "#{Colors::RED}HTTP #{code} Error:#{Colors::RESET} #{msg}"
       $stderr.puts "Detail: #{detail}" unless detail.empty?
+      if code == 401 && auth_type == "cookie"
+        $stderr.puts "#{Colors::YELLOW}Tip:#{Colors::RESET} Session cookie expired or invalid. Run '#{Colors::BOLD}sn login#{Colors::RESET}' to authenticate via SSO/MFA."
+      end
       exit 1
     end
   rescue StandardError => e
@@ -513,10 +522,554 @@ def parse_curl_command(text)
 end
 
 # ---------------------------------------------------------------------------
+# Browser SSO / MFA Login (Chrome DevTools Protocol)
+# ---------------------------------------------------------------------------
+
+BROWSER_CANDIDATES = %w[
+  chromium
+  chromium-browser
+  google-chrome
+  google-chrome-stable
+  brave-browser
+  brave
+  microsoft-edge
+  microsoft-edge-stable
+  vivaldi
+].freeze
+
+LOGIN_EXCLUDED_PATHS = %w[
+  /login.do
+  /login_with_sso.do
+  /saml_redirector.do
+  /logout.do
+  /external_logout_complete.do
+].freeze
+
+G_CK_REGEX = /(?:var\s+g_ck|["']?g_ck["']?)\s*[:=]\s*["']([0-9a-fA-F]{32,})["']/
+
+# Minimal RFC 6455 WebSocket client for communicating with local Chromium CDP endpoints.
+class CdpClient
+  class TimeoutError < StandardError; end
+
+  WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+  def initialize(ws_url, connect_timeout: 5)
+    uri = URI.parse(ws_url)
+    @seq = 0
+    @buf = "".b
+    @sock = TCPSocket.new(uri.host, uri.port)
+    @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1) rescue nil
+    handshake(uri, timeout: connect_timeout)
+  end
+
+  def call(method, params = {}, timeout: 15)
+    @seq += 1
+    req_id = @seq
+    send_frame(JSON.generate({ "id" => req_id, "method" => method, "params" => params }))
+
+    deadline = Time.now + timeout
+    loop do
+      remaining = deadline - Time.now
+      raise TimeoutError, "CDP call '#{method}' timed out" if remaining <= 0
+
+      raw = recv_frame(timeout: remaining)
+      msg = JSON.parse(raw)
+      next unless msg["id"] == req_id
+
+      if msg["error"]
+        err_msg = msg["error"].is_a?(Hash) ? msg["error"]["message"] : msg["error"].to_s
+        raise "CDP #{method} error: #{err_msg}"
+      end
+      return msg["result"] || {}
+    end
+  end
+
+  def close
+    @sock&.close
+  rescue StandardError
+    nil
+  end
+
+  private
+
+  def handshake(uri, timeout:)
+    key = [SecureRandom.random_bytes(16)].pack("m0")
+    path = uri.request_uri
+    req = "GET #{path} HTTP/1.1\r\n" \
+          "Host: #{uri.host}:#{uri.port}\r\n" \
+          "Upgrade: websocket\r\n" \
+          "Connection: Upgrade\r\n" \
+          "Sec-WebSocket-Key: #{key}\r\n" \
+          "Sec-WebSocket-Version: 13\r\n\r\n"
+    @sock.write(req)
+
+    deadline = Time.now + timeout
+    while (idx = @buf.index("\r\n\r\n")).nil?
+      remaining = deadline - Time.now
+      raise TimeoutError, "Timed out waiting for CDP WebSocket handshake" if remaining <= 0
+
+      fill_buf(remaining)
+    end
+
+    raw_headers = @buf.slice!(0, idx + 4)
+    lines = raw_headers.split("\r\n")
+    status_line = lines.shift
+    raise "WebSocket handshake failed: #{status_line.inspect}" unless status_line&.include?("101")
+
+    headers = {}
+    lines.each do |line|
+      k, v = line.split(":", 2)
+      headers[k.strip.downcase] = v.strip if k && v
+    end
+
+    expected_accept = [Digest::SHA1.digest("#{key}#{WS_GUID}")].pack("m0")
+    if headers["sec-websocket-accept"] && headers["sec-websocket-accept"] != expected_accept
+      raise "WebSocket handshake failed: invalid Sec-WebSocket-Accept"
+    end
+  end
+
+  def fill_buf(timeout)
+    if @sock.respond_to?(:timeout=)
+      @sock.timeout = timeout
+    elsif !@sock.wait_readable(timeout)
+      raise TimeoutError, "Timed out waiting for CDP WebSocket"
+    end
+    @buf << @sock.readpartial(16_384)
+  rescue IO::TimeoutError
+    raise TimeoutError, "Timed out waiting for CDP WebSocket"
+  end
+
+  def read_exact(n, timeout:)
+    return "".b if n <= 0
+
+    deadline = Time.now + timeout
+    while @buf.bytesize < n
+      remaining = deadline - Time.now
+      raise TimeoutError, "Timed out reading CDP WebSocket frame" if remaining <= 0
+
+      fill_buf(remaining)
+    end
+    @buf.slice!(0, n)
+  end
+
+  def send_frame(payload, opcode: 0x1)
+    bytes = payload.to_s.b
+    len = bytes.bytesize
+    first_byte = 0x80 | (opcode & 0x0F)
+    header = if len < 126
+               [first_byte, 0x80 | len].pack("CC")
+             elsif len <= 65_535
+               [first_byte, 0x80 | 126, len].pack("CCn")
+             else
+               [first_byte, 0x80 | 127, len].pack("CCQ>")
+             end
+
+    mask = SecureRandom.random_bytes(4)
+    m = mask.bytes
+    masked = bytes.bytes.each_with_index.map { |b, i| b ^ m[i & 3] }.pack("C*")
+    @sock.write(header + mask + masked)
+  end
+
+  def recv_frame(timeout:)
+    fragments = "".b
+    loop do
+      b1, b2 = read_exact(2, timeout: timeout).unpack("CC")
+      fin = (b1 & 0x80) != 0
+      opcode = b1 & 0x0F
+      masked = (b2 & 0x80) != 0
+      len = b2 & 0x7F
+
+      if len == 126
+        len = read_exact(2, timeout: timeout).unpack1("n")
+      elsif len == 127
+        len = read_exact(8, timeout: timeout).unpack1("Q>")
+      end
+
+      mask_key = masked ? read_exact(4, timeout: timeout).bytes : nil
+      payload = len > 0 ? read_exact(len, timeout: timeout) : "".b
+
+      if masked && len > 0
+        payload = payload.bytes.each_with_index.map { |b, i| b ^ mask_key[i & 3] }.pack("C*")
+      end
+
+      case opcode
+      when 0x8
+        begin
+          send_frame("", opcode: 0x8)
+        rescue StandardError
+          nil
+        end
+        raise EOFError, "CDP WebSocket closed"
+      when 0x9
+        send_frame(payload, opcode: 0xA)
+      when 0xA
+        next
+      when 0x0, 0x1, 0x2
+        fragments << payload
+        return fragments.force_encoding("UTF-8") if fin
+      end
+    end
+  end
+end
+
+WINDOWS_BROWSER_SUBPATHS = [
+  %w[Google Chrome Application chrome.exe],
+  %w[Microsoft Edge Application msedge.exe],
+  %w[BraveSoftware Brave-Browser Application brave.exe]
+].freeze
+
+def runnable_browser?(bin)
+  return false if bin.nil? || bin.strip.empty?
+
+  if Gem.win_platform?
+    return true if File.file?(bin)
+    return false if bin.include?("/") || bin.include?("\\")
+
+    IO.popen(["where.exe", bin], err: File::NULL, &:read)
+    return $?.success? || false
+  end
+
+  # Probe --version on POSIX to reject broken wrapper scripts (e.g. missing target binary)
+  IO.popen([bin, "--version"], err: File::NULL, &:read)
+  $?&.success? || false
+rescue StandardError
+  false
+end
+
+def find_browser_binary(preferred = nil)
+  candidates = []
+  candidates << preferred if preferred && !preferred.strip.empty?
+  candidates << ENV["SN_BROWSER"] if ENV["SN_BROWSER"] && !ENV["SN_BROWSER"].strip.empty?
+
+  if Gem.win_platform?
+    roots = [ENV["ProgramFiles"], ENV["ProgramFiles(x86)"], ENV["LOCALAPPDATA"]].compact.reject(&:empty?)
+    roots.each do |root|
+      WINDOWS_BROWSER_SUBPATHS.each { |parts| candidates << File.join(root, *parts) }
+    end
+    candidates.concat(%w[chrome.exe msedge.exe brave.exe])
+  end
+  candidates.concat(BROWSER_CANDIDATES)
+
+  candidates.uniq.find { |bin| runnable_browser?(bin) }
+end
+
+def sn_http_get(url_str, cookie_str, user_token = nil, timeout: 15)
+  uri = URI.parse(url_str)
+  req = Net::HTTP::Get.new(uri)
+  req["User-Agent"] = "sn-cli/1.1 (ruby)"
+  req["Cookie"] = cookie_str unless cookie_str.to_s.empty?
+  if user_token && !user_token.empty?
+    req["X-UserToken"] = user_token
+    req["Accept"] = "application/json"
+  end
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = (uri.scheme == "https")
+  http.open_timeout = timeout
+  http.read_timeout = timeout
+  http.request(req)
+end
+
+def fetch_g_ck_from_instance(instance, cookie_str)
+  base = instance.sub(%r{/+\z}, "")
+  instance_host = URI.parse(base).host&.downcase
+
+  %w[/navpage.do /now/nav/ui/home].each do |path|
+    url = "#{base}#{path}"
+    3.times do
+      resp = sn_http_get(url, cookie_str)
+      code = resp.code.to_i
+      if (300..399).include?(code) && resp["location"]
+        loc = URI.join(url, resp["location"])
+        break unless loc.host&.downcase == instance_host
+        break if LOGIN_EXCLUDED_PATHS.include?(loc.path)
+
+        url = loc.to_s
+        next
+      end
+      if code == 200
+        match = resp.body.to_s.match(G_CK_REGEX)
+        return match[1] if match
+      end
+      break
+    end
+  end
+  ""
+rescue StandardError
+  ""
+end
+
+def verify_sn_session(instance, cookie_str, user_token)
+  return nil if cookie_str.to_s.strip.empty?
+
+  base = instance.sub(%r{/+\z}, "")
+  token = user_token.to_s.strip
+  token = fetch_g_ck_from_instance(base, cookie_str) if token.empty?
+  return nil if token.empty?
+
+  query = URI.encode_www_form(
+    "sysparm_query"  => "sys_id=javascript:gs.getUserID()",
+    "sysparm_fields" => "user_name,name,email",
+    "sysparm_limit"  => "1"
+  )
+  resp = sn_http_get("#{base}/api/now/table/sys_user?#{query}", cookie_str, token)
+  return nil if resp["x-is-logged-in"].to_s.downcase == "false"
+  return nil if resp.code.to_i == 401
+
+  if resp.code.to_i == 200
+    data = JSON.parse(resp.body.to_s)
+    results = data["result"]
+    if results.is_a?(Array) && !results.empty?
+      uname = extract_raw_value(results[0]["user_name"])
+      return nil if uname.downcase == "guest"
+
+      return {
+        valid:      true,
+        username:   uname.empty? ? nil : uname,
+        full_name:  extract_display(results[0]["name"]),
+        user_token: token
+      }
+    end
+  end
+
+  # Fallback when sys_user read ACLs restrict access or return an empty set
+  fb_query = URI.encode_www_form("sysparm_fields" => "sys_id", "sysparm_limit" => "1")
+  fb_resp = sn_http_get("#{base}/api/now/table/task?#{fb_query}", cookie_str, token)
+  if fb_resp.code.to_i == 200 && fb_resp["x-is-logged-in"].to_s.downcase != "false"
+    return { valid: true, username: nil, user_token: token }
+  end
+
+  nil
+rescue StandardError
+  nil
+end
+
+def allocate_free_port
+  srv = TCPServer.new("127.0.0.1", 0)
+  port = srv.addr[1]
+  srv.close
+  port
+end
+
+def stop_browser_process(pid)
+  return unless pid
+
+  if Gem.win_platform?
+    Process.kill("KILL", pid)
+    Process.wait(pid)
+    return
+  end
+
+  Process.kill("TERM", pid)
+  20.times do
+    sleep 0.1
+    return if Process.wait(pid, Process::WNOHANG)
+  end
+  Process.kill("KILL", pid)
+  Process.wait(pid)
+rescue StandardError
+  nil
+end
+
+def browser_page_targets(port, target_host)
+  res = Net::HTTP.get_response(URI("http://127.0.0.1:#{port}/json/list"))
+  return [] unless res.code == "200"
+
+  targets = JSON.parse(res.body)
+  return [] unless targets.is_a?(Array)
+
+  targets.select do |t|
+    next false unless t["type"] == "page" && !t["webSocketDebuggerUrl"].to_s.empty?
+
+    begin
+      u = URI.parse(t["url"].to_s)
+      u.host&.downcase == target_host && !LOGIN_EXCLUDED_PATHS.include?(u.path)
+    rescue StandardError
+      false
+    end
+  end
+rescue StandardError
+  []
+end
+
+def extract_page_session_info(ws_url, instance)
+  cdp = CdpClient.new(ws_url)
+  js = <<~'JS'
+    (() => {
+      if (document.readyState === 'loading') return { ready: false };
+      const g_ck = window.g_ck ||
+                   (window.NOW && (window.NOW.g_ck || (window.NOW.session && window.NOW.session.g_ck))) ||
+                   (document.getElementById('sysparm_ck') && document.getElementById('sysparm_ck').value) ||
+                   ((document.documentElement && document.documentElement.innerHTML.match(/(?:var\s+g_ck|["']?g_ck["']?)\s*[:=]\s*["']([0-9a-fA-F]{32,})["']/)) || [])[1] ||
+                   '';
+      const user = (window.NOW && (window.NOW.user_name || (window.NOW.user && window.NOW.user.name))) || '';
+      return { ready: true, g_ck: g_ck, user: user, path: location.pathname };
+    })()
+  JS
+  eval_res = cdp.call("Runtime.evaluate", { "expression" => js, "returnByValue" => true })
+  info = eval_res.dig("result", "value")
+  return nil unless info.is_a?(Hash) && info["ready"]
+  return nil if info["user"].to_s.downcase == "guest"
+
+  cookie_res = cdp.call("Network.getCookies", { "urls" => [instance] })
+  cookies = cookie_res["cookies"] || []
+  return nil if cookies.empty?
+
+  names = cookies.map { |c| c["name"] }
+  has_session = names.any? { |n| %w[JSESSIONID glide_user_activity glide_session_store].include?(n) }
+  return nil unless has_session
+  return nil if info["g_ck"].to_s.empty? && !(names.include?("glide_user_activity") || names.include?("glide_session_store"))
+
+  cookie_str = cookies.map { |c| "#{c['name']}=#{c['value']}" }.join("; ")
+  { cookie_str: cookie_str, g_ck: info["g_ck"].to_s, js_user: info["user"].to_s }
+rescue StandardError
+  nil
+ensure
+  cdp&.close
+end
+
+def perform_browser_login(instance, profile: "default", browser: nil, timeout: 300, fresh: false)
+  browser_bin = find_browser_binary(browser)
+  if browser_bin.nil?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} No working Chromium-based browser found (#{BROWSER_CANDIDATES.join(', ')})."
+    $stderr.puts "Install Chromium or pass --browser /path/to/browser (or set SN_BROWSER)."
+    exit 1
+  end
+
+  target_host = URI.parse(instance).host&.downcase
+  if target_host.nil? || target_host.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Invalid ServiceNow instance URL '#{instance}'."
+    exit 1
+  end
+
+  user_data_dir = File.join(BROWSER_PROFILE_DIR, profile)
+  FileUtils.rm_rf(user_data_dir) if fresh
+  FileUtils.mkdir_p(BROWSER_PROFILE_DIR, mode: 0o700)
+  FileUtils.mkdir_p(user_data_dir, mode: 0o700)
+  File.chmod(0o700, BROWSER_PROFILE_DIR, user_data_dir)
+
+  port = allocate_free_port
+  cmd = [
+    browser_bin,
+    "--remote-debugging-port=#{port}",
+    "--user-data-dir=#{user_data_dir}",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--new-window",
+    "--app=#{instance.sub(%r{/+\z}, '')}/navpage.do"
+  ]
+
+  puts "#{Colors::CYAN}Opening #{browser_bin} for SSO/MFA login at #{Colors::BOLD}#{instance}#{Colors::RESET}#{Colors::CYAN}...#{Colors::RESET}"
+  puts "#{Colors::DIM}Complete authentication (Entra ID / MFA) in the browser window. It will close automatically once verified.#{Colors::RESET}"
+
+  pid = Process.spawn(*cmd, out: File::NULL, err: File::NULL)
+  deadline = Time.now + (timeout || 300)
+
+  begin
+    loop do
+      reaped = begin
+        Process.wait(pid, Process::WNOHANG)
+      rescue Errno::ECHILD
+        pid
+      end
+      if reaped
+        pid = nil
+        $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Browser window was closed before login completed."
+        exit 1
+      end
+
+      if Time.now > deadline
+        $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Timed out waiting for SSO/MFA login (#{timeout}s)."
+        exit 1
+      end
+
+      browser_page_targets(port, target_host).each do |target|
+        page_info = extract_page_session_info(target["webSocketDebuggerUrl"], instance)
+        next unless page_info
+
+        verified = verify_sn_session(instance, page_info[:cookie_str], page_info[:g_ck])
+        next unless verified
+
+        detected_user = verified[:username] || (page_info[:js_user].downcase == "guest" ? nil : page_info[:js_user])
+        return {
+          "cookie"     => page_info[:cookie_str],
+          "user_token" => verified[:user_token].to_s,
+          "username"   => detected_user.to_s,
+          "full_name"  => verified[:full_name].to_s
+        }
+      end
+
+      sleep 0.6
+    end
+  rescue Interrupt
+    $stderr.puts "\n#{Colors::YELLOW}Login cancelled.#{Colors::RESET}"
+    exit 130
+  ensure
+    stop_browser_process(pid)
+  end
+end
+
+# ---------------------------------------------------------------------------
 # Commands: Config & Tickets
 # ---------------------------------------------------------------------------
 
+def save_cookie_profile(profile, instance, cookie, user_token, username)
+  profile_data = {
+    "instance"   => instance,
+    "auth_type"  => "cookie",
+    "cookie"     => cookie,
+    "user_token" => user_token.to_s,
+    "username"   => username.to_s
+  }
+  save_config(profile, profile_data)
+  puts "#{Colors::GREEN}Saved cookie configuration for #{instance} to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+end
+
+def cmd_login(options)
+  profile = options[:profile]
+  existing = load_config(profile)
+
+  raw_inst = options[:instance] || existing.fetch("instance", "")
+  if raw_inst.to_s.strip.empty?
+    raw_inst = prompt_input("ServiceNow instance name or URL: ")
+  end
+  instance = normalize_instance_url(raw_inst)
+  if instance.empty?
+    $stderr.puts "#{Colors::RED}Error:#{Colors::RESET} Instance is required."
+    exit 1
+  end
+
+  result = perform_browser_login(
+    instance,
+    profile: profile,
+    browser: options[:browser],
+    timeout: options[:timeout] || 300,
+    fresh: options[:fresh] || false
+  )
+
+  detected = result["username"].to_s.strip
+  detected = "" if detected.downcase == "guest"
+  username = if options[:username] && !options[:username].strip.empty?
+               options[:username].strip
+             elsif !detected.empty?
+               detected
+             elsif !existing.fetch("username", "").strip.empty?
+               existing["username"].strip
+             else
+               prompt_input("Your ServiceNow username (optional, for --mine): ")
+             end
+
+  who = result["full_name"].to_s.empty? ? username : "#{result['full_name']} (#{username})"
+  puts "#{Colors::GREEN}Authenticated#{who.empty? ? '' : " as #{Colors::BOLD}#{who}#{Colors::RESET}#{Colors::GREEN}"}.#{Colors::RESET}"
+  save_cookie_profile(profile, instance, result["cookie"], result["user_token"], username)
+end
+
 def cmd_config(options)
+  if options[:sso]
+    cmd_login(options)
+    return
+  end
+
   profile = options[:profile]
   existing = load_config(profile)
 
@@ -546,15 +1099,7 @@ def cmd_config(options)
     username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
     username = default_user if username.empty?
 
-    profile_data = {
-      "instance"   => instance,
-      "auth_type"  => "cookie",
-      "cookie"     => parsed_curl["cookie"],
-      "user_token" => parsed_curl["user_token"].to_s,
-      "username"   => username
-    }
-    save_config(profile, profile_data)
-    puts "#{Colors::GREEN}Saved cookie configuration for #{instance} to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+    save_cookie_profile(profile, instance, parsed_curl["cookie"], parsed_curl["user_token"], username)
     return
   end
 
@@ -573,15 +1118,7 @@ def cmd_config(options)
     username = prompt_input("Your ServiceNow username (optional, for --mine) [#{default_user}]: ")
     username = default_user if username.empty?
 
-    profile_data = {
-      "instance"   => instance,
-      "auth_type"  => "cookie",
-      "cookie"     => inline_curl["cookie"],
-      "user_token" => inline_curl["user_token"].to_s,
-      "username"   => username
-    }
-    save_config(profile, profile_data)
-    puts "#{Colors::GREEN}Saved cookie configuration for #{instance} to #{CONFIG_PATH} (permissions 0600).#{Colors::RESET}"
+    save_cookie_profile(profile, instance, inline_curl["cookie"], inline_curl["user_token"], username)
     return
   end
 
@@ -592,8 +1129,12 @@ def cmd_config(options)
   end
 
   default_auth = existing.fetch("auth_type", "basic")
-  auth_type = prompt_input("Auth method (basic / token / cookie / curl) [#{default_auth}]: ").downcase
+  auth_type = prompt_input("Auth method (basic / token / cookie / sso) [#{default_auth}]: ").downcase
   auth_type = default_auth if auth_type.empty?
+  if %w[sso login browser].include?(auth_type)
+    cmd_login(options.merge(instance: instance))
+    return
+  end
   auth_type = "cookie" if auth_type == "curl"
 
   profile_data = {
@@ -611,7 +1152,7 @@ def cmd_config(options)
     profile_data["token"] = token
     profile_data["username"] = username
   when "cookie"
-    puts "#{Colors::DIM}Tip: Right-click any /api/now/... request in Chrome DevTools -> Copy -> Copy as cURL, then paste below (or type 'clip' to read from clipboard).#{Colors::RESET}"
+    puts "#{Colors::DIM}Tip: Run 'sn login' for interactive SSO/MFA, or paste 'Copy as cURL' from DevTools below (or type 'clip').#{Colors::RESET}"
     raw_input = prompt_input("Paste 'Copy as cURL', Cookie header string, or 'clip': ")
     raw_input = read_clipboard_text.to_s if %w[clip clipboard].include?(raw_input.downcase)
 
@@ -1153,13 +1694,14 @@ end
 def main_help
   c = Colors
   <<~HELP
-    #{c::BOLD}#{c::YELLOW}usage:#{c::RESET} #{c::BOLD}#{c::CYAN}sn#{c::RESET} [#{c::GREEN}-h#{c::RESET}] [#{c::GREEN}-p#{c::RESET} #{c::CYAN}PROFILE#{c::RESET}] #{c::MAGENTA}{config,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET} ...
+    #{c::BOLD}#{c::YELLOW}usage:#{c::RESET} #{c::BOLD}#{c::CYAN}sn#{c::RESET} [#{c::GREEN}-h#{c::RESET}] [#{c::GREEN}-p#{c::RESET} #{c::CYAN}PROFILE#{c::RESET}] #{c::MAGENTA}{config,login,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET} ...
 
     #{c::BOLD}ServiceNow CLI for querying, creating, and updating tickets and CMDB items.#{c::RESET}
 
     #{c::BOLD}#{c::YELLOW}positional arguments:#{c::RESET}
-      #{c::MAGENTA}{config,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET}
+      #{c::MAGENTA}{config,login,get,list,query,ls,create,update,comment,cmdb,help}#{c::RESET}
         #{c::BOLD}#{c::CYAN}config#{c::RESET}              Configure ServiceNow instance URL and credentials
+        #{c::BOLD}#{c::CYAN}login#{c::RESET} #{c::DIM}(auth)#{c::RESET}        Authenticate interactively via browser SSO/MFA (Entra ID / SAML)
         #{c::BOLD}#{c::CYAN}get#{c::RESET}                 Get details of a single ticket by Number or sys_id
         #{c::BOLD}#{c::CYAN}list#{c::RESET} #{c::DIM}(query, ls)#{c::RESET}    Query and list tickets
         #{c::BOLD}#{c::CYAN}create#{c::RESET}              Create a new Incident or ticket
@@ -1173,8 +1715,9 @@ def main_help
       #{c::BOLD}#{c::GREEN}-p#{c::RESET}, #{c::BOLD}#{c::GREEN}--profile#{c::RESET} #{c::CYAN}PROFILE#{c::RESET} Config profile name #{c::DIM}(default: 'default')#{c::RESET}
 
     #{c::BOLD}#{c::YELLOW}Examples:#{c::RESET}
-      #{c::DIM}# Setup#{c::RESET}
+      #{c::DIM}# Setup & SSO/MFA Login#{c::RESET}
       #{c::CYAN}sn config#{c::RESET}
+      #{c::CYAN}sn login#{c::RESET} #{c::GREEN}-i#{c::RESET} mycompany
 
       #{c::DIM}# Query & Inspect Tickets#{c::RESET}
       #{c::CYAN}sn get#{c::RESET} INC0010001 #{c::GREEN}--comments#{c::RESET}
@@ -1326,12 +1869,28 @@ def main
   case command
   when "config"
     parser = OptionParser.new do |opts|
-      opts.banner = "usage: sn config [-h] [-p PROFILE] [--curl]"
+      opts.banner = "usage: sn config [-h] [-p PROFILE] [--curl] [--sso]"
       add_profile_opt(opts, options)
       opts.on("--curl", "Import instance, Cookie, and X-UserToken directly from a 'Copy as cURL' command in clipboard") { options[:curl] = true }
+      opts.on("--sso", "Authenticate interactively in a browser window (Entra ID / SAML SSO + MFA)") { options[:sso] = true }
+      opts.on("--login", "Alias for --sso") { options[:sso] = true }
     end
     parse_with_errors(parser, args)
     cmd_config(options)
+
+  when "login", "auth"
+    parser = OptionParser.new do |opts|
+      opts.banner = "usage: sn #{command} [-h] [-p PROFILE] [-i INSTANCE] [-u USERNAME] [--browser BROWSER] [--timeout SECONDS] [--fresh]"
+      add_profile_opt(opts, options)
+      opts.on("-i", "--instance INSTANCE", "ServiceNow instance name or URL") { |v| options[:instance] = v }
+      opts.on("-u", "--user USERNAME", "Override ServiceNow username (for --mine)") { |v| options[:username] = v }
+      opts.on("--browser BROWSER", "Browser executable name or path (e.g. chromium, google-chrome)") { |v| options[:browser] = v }
+      opts.on("--timeout SECONDS", Integer, "Max seconds to wait for SSO/MFA login (default: 300)") { |v| options[:timeout] = v }
+      opts.on("--fresh", "Clear saved browser SSO session before opening login window") { options[:fresh] = true }
+    end
+    parse_with_errors(parser, args)
+    options[:instance] = args.shift if options[:instance].nil? && !args.empty?
+    cmd_login(options)
 
   when "get"
     parser = OptionParser.new do |opts|

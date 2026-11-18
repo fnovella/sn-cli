@@ -82,10 +82,21 @@ sn -p dev list --mine
 2. **`token` (OAuth / Bearer Token)**
    Sends `Authorization: Bearer <token>`.
 3. **`cookie` (Enterprise SSO / Browser Session)**
-   If your organization enforces SAML/Entra ID SSO and blocks basic authentication:
-   - Open your ServiceNow instance in Chrome/Edge/Firefox and open DevTools (`F12` -> **Network** tab).
-   - Right-click any `/api/now/...` request and select **Copy** -> **Copy as cURL** (supports both *Copy as cURL (bash)* and Windows *Copy as cURL (cmd)*).
-   - Run `sn config` (or `sn config --curl`)—it will automatically detect the `Copy as cURL` command in your clipboard on Linux, macOS, and Windows (or let you paste it directly) and extract your instance URL, `Cookie`, and `X-UserToken` automatically.
+   If your organization enforces SAML/Entra ID SSO and MFA:
+   - **Option A — Interactive Browser Login (Recommended)**:
+     ```bash
+     # Opens a Chromium-based browser window to complete Entra ID / MFA
+     sn login -i mycompany
+
+     # Refresh an expired session (or use --fresh to clear the saved browser profile)
+     sn login
+     sn login --fresh
+     ```
+     Once you finish signing in and passing MFA, `sn` automatically extracts the session cookies (`HttpOnly` included), `X-UserToken` (`g_ck`), and your ServiceNow username, saves them to `~/.config/servicenow/config.json` (`%USERPROFILE%\.config\servicenow\config.json` on Windows), and closes the browser window. You can also launch this via `sn config --sso` or by choosing `sso` in `sn config`.
+   - **Option B — Copy as cURL (Manual)**:
+     - Open your ServiceNow instance in Chrome/Edge/Firefox and open DevTools (`F12` -> **Network** tab).
+     - Right-click any `/api/now/...` request and select **Copy** -> **Copy as cURL** (supports both *Copy as cURL (bash)* and Windows *Copy as cURL (cmd)*).
+     - Run `sn config` (or `sn config --curl`)—it will automatically detect the `Copy as cURL` command in your clipboard on Linux, macOS, and Windows (or let you paste it directly) and extract your instance URL, `Cookie`, and `X-UserToken` automatically.
 
 ### Environment Variables
 
@@ -97,6 +108,7 @@ You can override any profile setting using environment variables:
 | `SN_USER` | ServiceNow username |
 | `SN_PASS` | ServiceNow password (sets `basic` auth) |
 | `SN_TOKEN` | Bearer token (sets `token` auth) |
+| `SN_BROWSER` | Browser binary name or path for `sn login` (e.g. `chromium`, `google-chrome`) |
 | `NO_COLOR` | Set to `1` to disable ANSI terminal colors |
 
 ---
